@@ -15,7 +15,7 @@
   "dump_bin_tracks": 500,
   "daily_cap": 0,
   "actor_id": "https://apify.com/augeas/spotify-playlists",
-  "results_per_keyword": 10,
+  "results_per_keyword": 5,
   "track_limit": 200,
   "use_apify_proxy": false,
   "skip_instrumental": true,
