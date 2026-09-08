@@ -1,6 +1,24 @@
 # Changelog
 
-## v2.0 — current: ONE hardwired actor that does everything
+## v3.0 — current: free Spotify Web API engine
+
+- **Discovery now uses Spotify's official Web API by default — $0.** Client-credentials auth (no user login), search paginated 50/page, gentle pacing, 429 back-off, token refresh. Spotify-owned playlists return 404 to dev-mode apps — skipped (they were skipped anyway).
+- **Enrich (step 3) is free too**: one `GET /playlists/{id}` per *contactable* playlist → followers, popularity (Reachability), added-dates (real Freshness).
+- Shared `ingest_items()` pipeline: both engines feed the same filters/sweep/owner-pivot/summary.
+- Apify remains optional (Settings → Data source). Instagram bio scrape still uses Apify (pay-per-result).
+- Intent detector: "send tracks / send your music / send demos" now count as invites.
+- Fixed: Playlists/Send crash on an empty database.
+
+## v2.1: runs are bounded and stoppable
+
+- **Hard time limit on every run, enforced by Apify** (`run_timeout`, default 6 min, Advanced). The run cannot outlive it; whatever it collected is imported anyway.
+- **Live run panel with a Stop button.** Discovery no longer blocks the page: the run starts, a panel polls every 3 s (status · records · elapsed vs limit), and *Stop & import what's collected* aborts the run and imports the partial results. Search is disabled while a run is active.
+- Active run is persisted to disk — a refreshed tab resumes the same run instead of losing it.
+- Duplicate records per playlist merge to the **richest** one (the actor writes a search record + an expanded record). **Import a finished run** by dataset ID as a safety net.
+- Default 100 tracks/playlist; search page size matched to results requested. Aborted/timed-out runs with data are treated as importable.
+- Both documented actors supported (augeas rental w/ dates; ScrapeArchitect pay-per-result), auto-detected from the slug; pasted URLs/IDs normalised; *Check actor* button.
+
+## v2.0: ONE hardwired actor that does everything
 
 - **Hardwired to the “Spotify Playlists” actor** (`terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration`). Its output (`playlistId, playlistName, description, ownerName, ownerId, followers, totalTracks, tracks[].plays, tracks[].addedAt`) is the only one found with keyword search + followers + playcounts + **added-dates** in one pass.
 - Removed the template / schema-reading UI and the details-actor slot — no field-name guessing anywhere. One config field: the actor slug or ID.

@@ -14,3 +14,4 @@ my_profile.json
 __pycache__/
 *.pyc
 .DS_Store
+.active_run.json

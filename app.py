@@ -11,6 +11,7 @@ pattern, same GitHub auto-save, same Apify + Gemini + Claude.ai plumbing.
 
 import io
 import os
+from datetime import timedelta
 import re
 import json
 import time
@@ -53,7 +54,7 @@ APIFY_POLL_TIMEOUT_SECS = 15 * 60
 GEMINI_MODEL = "gemini-2.5-flash"
 FOLLOW_UP_DAYS = 7
 
-KEY_NAMES = {"APIFY_API_TOKEN": "Apify", "GEMINI_API_KEY": "Gemini"}
+KEY_NAMES = {"SPOTIFY_CLIENT_ID": "Spotify ID", "SPOTIFY_CLIENT_SECRET": "Spotify secret", "APIFY_API_TOKEN": "Apify (IG)", "GEMINI_API_KEY": "Gemini"}
 
 def get_secret(name):
     try:
@@ -87,9 +88,13 @@ DEFAULT_PROFILE = {
     "lane_max_pop": 55,
     "dump_bin_tracks": 500,
     "daily_cap": 0,                  # 0 = no send cap. Outreach pacing is the user's call, not the app's.
-    "actor_id": "augeas/spotify-playlists",   # https://apify.com/augeas/spotify-playlists — hardwired default
+    "data_source": "spotify_api",    # "spotify_api" (free, official) or "apify" (paid actor)
+    "actor_id": "augeas/spotify-playlists",   # only used when data_source == "apify"
     "results_per_keyword": 20,
-    "track_limit": 200,              # tracks fetched per playlist. Freshness = newest addedAt among fetched tracks, so fetch enough to reach the end.
+    "track_limit": 50,               # tracks fetched per playlist = ONE request. Enough for median plays (artist size) and newest addedAt (freshness).
+    "fetch_tracks": False,           # search WITHOUT tracks (fast). Tracks are fetched later, only for contactable playlists (Discover → step 3).
+    "run_timeout_min": 6,            # HARD limit — Apify kills the run at this point; whatever was collected is imported anyway
+    "runaway_factor": 2.5,           # if records exceed (playlists asked × this), the app aborts the run itself and imports
     "use_apify_proxy": False,        # actor default is no proxy (it uses Spotify's API, not page scraping) — proxies are the hidden cost
     "skip_instrumental": True,       # drop type-beat / instrumental playlists at ingest (they won't add vocals)
     "skip_mainstream": True,         # drop "famous songs / Top 100 / chart hits / Drake, Eminem, Kanye…" playlists at ingest
@@ -170,7 +175,7 @@ def ensure_schema(df):
         df[col] = pd.to_datetime(df[col], errors="coerce")
     df["Draft Pitch"] = df["Draft Pitch"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
     if len(df):  # derived every load: from Last Added when known, else the curator's own claim
-        df["Freshness"] = [freshness_label(la, d) for la, d in zip(df["Last Added"], df["Description"])]
+        df["Freshness"] = [freshness_label(la, d, nm) for la, d, nm in zip(df["Last Added"], df["Description"], df["Playlist Name"])]
     df["Instagram"] = df["Instagram"].apply(lambda x: str(x).split(",")[0].strip() if is_valid_data(x) else "None")
     ordered = [c for c in COLUMN_ORDER if c in df.columns]
     extras = [c for c in df.columns if c not in ordered]
@@ -505,7 +510,7 @@ SUBMISSION_LINK_RE = re.compile(r'((?:https?://)?(?:www\.)?[^\s<>"\']*' + SUBMIS
 BARE_DOMAIN_RE = re.compile(r'^(?:https?://)?(?:www\.)?([a-z0-9-]+\.(?:com|net|io|co|app|fm|to|link|me|org|music))(?:/\S*)?$', re.IGNORECASE)
 PAID_RE = re.compile(r'(sbmt\.to|submithub|groover|musosoup|playlist\s*push|upnextapp|dailyplaylists|soundcampaign|\$\s?\d|\d\s?(usd|eur|€|£)|paid\s*(promo|placement|submission)|\bfee\b|pay\s*to\s*(play|submit))', re.IGNORECASE)
 INTENT_RE = re.compile(
-    r'\b(submit|submission|submissions|pitch|for\s+consideration|send\s+(us|me)\s+your|dm\s+(me|us)?\s*(for|to)|email\s+(me|us)?\s*(for|to|at)|add\s+your|want\s+to\s+be\s+(added|featured)|open\s+for|accepting'
+    r'\b(submit|submission|submissions|pitch|for\s+consideration|send\s+(?:us\s+|me\s+)?(?:your\s+)?(?:tracks?|music|songs?|demos?|links?)|dm\s+(me|us)?\s*(for|to)|email\s+(me|us)?\s*(for|to|at)|add\s+your|want\s+to\s+be\s+(added|featured)|open\s+for|accepting'
     r'|tienes\s+temas|env[ií]a|manda|m[aá]ndanos|contacto|cont[aá]ctame|por\s+aqu[ií]'          # es
     r'|envie|mande|submeta|contato'                                                             # pt
     r'|envoyez|soumettre|proposer|contactez'                                                     # fr
@@ -645,15 +650,27 @@ def looks_mainstream(name, description):
 # fall back to the curator's own claim ("updated weekly") as a labelled hint, never as fact.
 FRESH_HINT_RE = re.compile(r"\b(updated?\s+(?:daily|weekly|regularly|often|every|each|monthly|constantly|frequently)|(?:new|fresh)\s+(?:music|tracks|songs|releases|adds?)\s+(?:weekly|daily|every|each|monthly|added)|daily\s+updates?|weekly\s+updates?|actualizad[ao]|aggiornat[ao]|mise\s+à\s+jour|wöchentlich\s+aktualisiert|i\s+add\s+to\s+this\s+(?:daily|weekly|often|regularly))\b", re.I)
 
-def freshness_label(last_added, description=""):
+YEAR_RE = re.compile(r"\b(20[1-3][0-9])\b")
+
+def freshness_label(last_added, description="", name=""):
+    """Real dates when tracks were fetched; otherwise free text signals: the curator's own claim
+    ('updated weekly') or a year stamp ('Chill Rap 2026' = live, 'Best of 2022' = likely abandoned)."""
     if pd.notna(last_added):
         days = (pd.Timestamp.now() - pd.Timestamp(last_added)).days
         if days <= 30: return "Fresh (≤30d)"
         if days <= 90: return "Active (≤90d)"
         if days <= 365: return "Stale (≤1y)"
         return "Dormant (>1y)"
-    m = FRESH_HINT_RE.search(normalize_text(description) or "")
-    return f"Claims: {m.group(0).lower()}" if m else "Unknown"
+    text = normalize_text(f"{name} {description}")
+    m = FRESH_HINT_RE.search(text)
+    if m:
+        return f"Claims: {m.group(0).lower()}"
+    years = [int(y) for y in YEAR_RE.findall(text)]
+    if years:
+        y, now = max(years), pd.Timestamp.now().year
+        if y >= now - 1: return f"Mentions {y}"
+        return f"Mentions {y} — likely stale"
+    return "Unknown"
 
 def contact_tier(email, ig, link, playlist_name, description):
     has = is_valid_data(email) or is_valid_data(ig) or bool(link)
@@ -779,15 +796,20 @@ def clean_with_gemini(client, model, owner_name, playlist_name):
 # ----------------------------------------------------------------------------
 # Apify helper (ported)
 # ----------------------------------------------------------------------------
-def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label, max_usd=None, max_items=None):
-    """Start an actor with a HARD per-run spend cap (Apify aborts the run at the cap) and poll to completion."""
+def _start_kwargs(run_input, max_usd=None, max_items=None, timeout_min=None):
     from decimal import Decimal
     kwargs = {"run_input": run_input}
     if max_usd:
         kwargs["max_total_charge_usd"] = Decimal(str(round(float(max_usd), 2)))
     if max_items:
         kwargs["max_items"] = int(max_items)
-    run_obj = client.actor(actor_id).start(**kwargs)
+    if timeout_min:
+        kwargs["run_timeout"] = timedelta(minutes=float(timeout_min))   # Apify enforces this — the run cannot outlive it
+    return kwargs
+
+def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label, max_usd=None, max_items=None, timeout_min=None):
+    """Blocking helper for SHORT jobs (IG bios, detail refresh). Starts with a hard Apify time limit and polls."""
+    run_obj = client.actor(actor_id).start(**_start_kwargs(run_input, max_usd, max_items, timeout_min))
     run_id = run_obj.get("id") if isinstance(run_obj, dict) else getattr(run_obj, "id", None)
     dataset_id = run_obj.get("defaultDatasetId") if isinstance(run_obj, dict) else getattr(run_obj, "default_dataset_id", getattr(run_obj, "defaultDatasetId", ""))
     if not run_id or not dataset_id:
@@ -800,14 +822,75 @@ def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label
         item_count = 0 if not dataset_info else (dataset_info.get("itemCount", 0) if isinstance(dataset_info, dict) else getattr(dataset_info, "item_count", 0))
         elapsed = int(time.time() - start_time)
         progress_val = min(0.95, item_count / total_targets) if total_targets > 0 else 0.5
-        report(progress_val, f"{label}: {item_count}/{total_targets} · {elapsed}s · {status}")
+        extra = " (actor writes a search record + an expanded record per playlist; duplicates are merged on import)" if total_targets and item_count > total_targets else ""
+        report(progress_val, f"{label}: {item_count} records · ~{total_targets} playlists expected · {elapsed}s · {status}{extra}")
         if status in ["SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"]:
             break
         if elapsed > APIFY_POLL_TIMEOUT_SECS:
             status = "TIMED-OUT (gave up waiting — check the run in your Apify console)"
             break
         time.sleep(1.5)
+    if status in ("TIMED-OUT", "ABORTED") and item_count > 0:
+        status = "SUCCEEDED"   # partial data is still data — import what was collected
     return status, dataset_id
+
+# ----------------------------------------------------------------------------
+# Non-blocking discovery run: start → poll in a fragment (page stays responsive, Stop button works) →
+# import when terminal. State persisted to disk so a refreshed tab resumes the same run.
+# ----------------------------------------------------------------------------
+ACTIVE_RUN_FILE = ".active_run.json"
+
+def _active_run_load():
+    if os.path.exists(ACTIVE_RUN_FILE):
+        try:
+            with open(ACTIVE_RUN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def _active_run_save(run):
+    if run is None:
+        if os.path.exists(ACTIVE_RUN_FILE):
+            os.remove(ACTIVE_RUN_FILE)
+        return
+    with open(ACTIVE_RUN_FILE, "w") as f:
+        json.dump(run, f)
+
+def start_discovery_run(token, prof, keywords=None, urls=None, plain_urls=False):
+    """Kick off the actor and return a run record. Does NOT wait."""
+    from apify_client import ApifyClient
+    client = ApifyClient(token)
+    actor = normalize_actor_id(prof.get("actor_id"))
+    per_kw, tl = int(prof.get("results_per_keyword", 20)), int(prof.get("track_limit", 100))
+    if urls:
+        run_input, total = build_url_input(urls, tl, prof, plain=plain_urls), len(urls)
+    else:
+        run_input, total = build_search_input(keywords, per_kw, tl, prof), per_kw * len(keywords)
+    cap = float(prof.get("max_usd_per_run", 0.0) or 0)
+    run_obj = client.actor(actor).start(**_start_kwargs(run_input, cap or None, total, prof.get("run_timeout_min", 6)))
+    run_id = run_obj.get("id") if isinstance(run_obj, dict) else getattr(run_obj, "id", None)
+    ds = run_obj.get("defaultDatasetId") if isinstance(run_obj, dict) else getattr(run_obj, "default_dataset_id", None)
+    if not run_id or not ds:
+        raise RuntimeError("Apify did not return a run/dataset id.")
+    run = {"run_id": run_id, "dataset_id": ds, "started": time.time(), "total": total, "keywords": keywords or [],
+           "urls": urls or [], "plain_urls": plain_urls, "actor": actor, "timeout_min": float(prof.get("run_timeout_min", 6))}
+    _active_run_save(run)
+    return run
+
+def poll_discovery_run(token, run):
+    from apify_client import ApifyClient
+    client = ApifyClient(token)
+    info = client.run(run["run_id"]).get() or {}
+    dsinfo = client.dataset(run["dataset_id"]).get() or {}
+    return info.get("status", "UNKNOWN"), int(dsinfo.get("itemCount", 0) or 0)
+
+def abort_discovery_run(token, run):
+    from apify_client import ApifyClient
+    try:
+        ApifyClient(token).run(run["run_id"]).abort()
+    except Exception:
+        pass
 
 # ----------------------------------------------------------------------------
 # Backup ZIP + flash messages (ported)
@@ -845,11 +928,171 @@ def show_flash():
         getattr(st, level, st.info)(msg)
 
 # ----------------------------------------------------------------------------
-# Actor — hardwired to the "Spotify Playlists" actor (input per its docs: terms / startUrls / maxItems /
-# maxTracks / pageSize / expand / proxyConfiguration). Output per its sample: playlistId, playlistName,
-# description, ownerName, ownerId, followers, totalTracks, tracks[] {artists[].artistName, plays, addedAt}.
-# The ONLY actor found that does keyword search + followers + playcounts + added-dates in one pass.
 # ----------------------------------------------------------------------------
+# Spotify Web API engine (FREE, official). Client-credentials flow — no user login.
+# Search: GET /v1/search?type=playlist → name, description, owner, track total (no followers).
+# Details: GET /v1/playlists/{id} → followers, snapshot, first 100 tracks with added_at + popularity.
+# Results are shaped like the actor output so the same mapper/filters run unchanged.
+# ----------------------------------------------------------------------------
+SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+SPOTIFY_API = "https://api.spotify.com/v1"
+SPOTIFY_PACE_SECS = 0.25  # gentle pacing keeps us well inside Spotify's rolling rate limit
+
+def _http_json(url, method="GET", headers=None, data=None, timeout=30):
+    """Small urllib wrapper. Returns (status, json_or_None, headers)."""
+    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, (json.loads(body) if body else None), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        try:
+            j = json.loads(body) if body else None
+        except Exception:
+            j = {"raw": body[:300]}
+        return e.code, j, dict(e.headers or {})
+
+def spotify_token(force=False):
+    cid, sec = get_key("SPOTIFY_CLIENT_ID"), get_key("SPOTIFY_CLIENT_SECRET")
+    if not cid or not sec:
+        raise RuntimeError("Spotify Client ID / Secret missing — add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to your secrets (see README: free Spotify developer app).")
+    tok = st.session_state.get("_sp_tok")
+    if tok and not force and tok.get("exp", 0) > time.time() + 30:
+        return tok["access_token"]
+    basic = base64.b64encode(f"{cid}:{sec}".encode()).decode()
+    status, j, _ = _http_json(SPOTIFY_TOKEN_URL, "POST", {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+                              b"grant_type=client_credentials")
+    if status != 200 or not j or "access_token" not in j:
+        raise RuntimeError(f"Spotify auth failed ({status}): {(j or {}).get('error_description') or (j or {}).get('error') or j}")
+    st.session_state["_sp_tok"] = {"access_token": j["access_token"], "exp": time.time() + int(j.get("expires_in", 3600))}
+    return j["access_token"]
+
+def _sp_get(path, params=None, retries=3):
+    """GET with bearer token, 429 back-off, one 401 token refresh."""
+    from urllib.parse import urlencode
+    url = f"{SPOTIFY_API}{path}" + (("?" + urlencode(params)) if params else "")
+    for attempt in range(retries + 1):
+        status, j, hdrs = _http_json(url, headers={"Authorization": f"Bearer {spotify_token()}"})
+        if status == 200:
+            return j
+        if status == 401 and attempt == 0:
+            spotify_token(force=True); continue
+        if status == 429:
+            wait = int((hdrs.get("Retry-After") or hdrs.get("retry-after") or 2))
+            time.sleep(min(wait, 30)); continue
+        if status in (404, 403):
+            return None  # e.g. Spotify-owned playlists are hidden from dev-mode apps — we skip those anyway
+        if status >= 500 and attempt < retries:
+            time.sleep(1.5); continue
+        raise RuntimeError(f"Spotify API {status} on {path}: {(j or {}).get('error', j)}")
+    return None
+
+def spotify_search_playlists(term, limit):
+    """Simplified playlist objects for a search term (paginates 50 at a time)."""
+    out, offset = [], 0
+    while len(out) < limit:
+        page = min(50, limit - len(out))
+        j = _sp_get("/search", {"q": term, "type": "playlist", "limit": page, "offset": offset})
+        items = ((j or {}).get("playlists") or {}).get("items") or []
+        items = [i for i in items if i]  # Spotify sometimes returns nulls in the list
+        if not items:
+            break
+        out.extend(items); offset += len(items)
+        if len(items) < page:
+            break
+        time.sleep(SPOTIFY_PACE_SECS)
+    return out[:limit]
+
+SP_FIELDS = "id,name,description,external_urls,snapshot_id,followers.total,owner(display_name,id,external_urls),tracks.total,tracks.items(added_at,track(name,popularity,artists(name)))"
+
+def spotify_playlist_details(pid):
+    return _sp_get(f"/playlists/{pid}", {"fields": SP_FIELDS})
+
+def spotify_to_row_item(simple, details=None, keyword=""):
+    """Shape a Spotify API playlist (simplified and/or full) like the actor output the mapper already reads."""
+    src = details or simple or {}
+    owner = src.get("owner") or (simple or {}).get("owner") or {}
+    tracks = []
+    for it in ((details or {}).get("tracks") or {}).get("items") or []:
+        t = (it or {}).get("track") or {}
+        tracks.append({"trackName": t.get("name", ""), "artists": [{"artistName": a.get("name", "")} for a in (t.get("artists") or []) if a],
+                       "popularity": t.get("popularity"), "addedAt": it.get("added_at")})
+    return {
+        "playlistId": src.get("id") or (simple or {}).get("id"),
+        "playlistName": src.get("name") or (simple or {}).get("name", ""),
+        "description": src.get("description") or (simple or {}).get("description", "") or "",
+        "playlistUrl": ((src.get("external_urls") or {}).get("spotify")) or ((simple or {}).get("external_urls") or {}).get("spotify", ""),
+        "ownerName": owner.get("display_name", ""), "ownerId": owner.get("id", ""),
+        "owner_url": (owner.get("external_urls") or {}).get("spotify", ""),
+        "followers": ((details or {}).get("followers") or {}).get("total", 0) if details else 0,
+        "totalTracks": ((src.get("tracks") or {}).get("total")) or (((simple or {}).get("tracks") or {}).get("total")) or 0,
+        "tracks": tracks, "keyword": keyword,
+    }
+
+def core_discover_spotify(df, seen, blocked, prof, keywords, report, urls=None):
+    """Free engine: search (no tracks) — or fetch given playlist URLs with details — then the same ingest pipeline."""
+    per_kw = int(prof.get("results_per_keyword", 20))
+    items = []
+    if urls:
+        for i, u in enumerate(urls):
+            pid = _playlist_id_from(u)
+            report(i / max(1, len(urls)), f"Fetching playlist {i + 1}/{len(urls)}…")
+            d = spotify_playlist_details(pid)
+            if d:
+                items.append(spotify_to_row_item(None, d, "url"))
+            time.sleep(SPOTIFY_PACE_SECS)
+    else:
+        for i, kw in enumerate(keywords):
+            report(i / max(1, len(keywords)), f"Searching Spotify: “{kw}” ({i + 1}/{len(keywords)})…")
+            for simple in spotify_search_playlists(kw, per_kw):
+                items.append(spotify_to_row_item(simple, None, kw))
+            time.sleep(SPOTIFY_PACE_SECS)
+    report(0.97, "Filtering, sweeping contacts, scoring…")
+    return ingest_items(df, seen, blocked, prof, items, keywords, urls)
+
+def enrich_with_spotify(df, idxs, report):
+    """Step 3 on the free engine: one details call per playlist → followers, popularity, added-dates."""
+    updated = 0
+    for k, i in enumerate(idxs):
+        pid = str(df.at[i, "Playlist_ID"])
+        report(k / max(1, len(idxs)), f"Enriching {k + 1}/{len(idxs)}: {df.at[i, 'Playlist Name'][:40]}")
+        d = spotify_playlist_details(pid)
+        if not d:
+            continue
+        row = normalize_playlist_item(spotify_to_row_item(None, d, "enrich"), "enrich", PROF)
+        if not row:
+            continue
+        for col in ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Reachability", "Quality Score", "Is Dump Bin"]:
+            if col in ("Saves", "Track Count", "Median Popularity", "Median Playcount") and not row[col]:
+                continue
+            df.at[i, col] = row[col]
+        if pd.notna(row["Last Added"]):
+            df.at[i, "Last Added"] = row["Last Added"]
+        if not is_valid_data(df.at[i, "Description"]) and row["Description"]:
+            df.at[i, "Description"] = row["Description"]
+        updated += 1
+        time.sleep(SPOTIFY_PACE_SECS)
+    return df, updated
+
+# Actors — two documented actors, chosen by the slug you set. Inputs are each actor's exact keys; no guessing.
+#   augeas/spotify-playlists  (RENTAL — monthly fee, not covered by free credit)
+#       in:  terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration
+#       out: playlistId, playlistName, description, ownerName, ownerId, followers, totalTracks, tracks[].plays, tracks[].addedAt  → real Freshness
+#   ScrapeArchitect "Spotify Playlist Scraper"  (pay-per-result — runs on free credit)
+#       in:  searchMode / keywords / urls / maxResults / fetchDetails / trackLimit / proxyCountry
+#       out: playlist_id, playlist_title, playlist_url, playlist_owner, owner_url, playlist_description,
+#            playlist_followers, total_tracks, tracks[] (artists, "tracks popularity")             → no added-dates
+# ----------------------------------------------------------------------------
+ACTOR_AUGEAS = "augeas/spotify-playlists"
+
+def actor_family(actor_id):
+    a = str(actor_id or "").lower()
+    return "augeas" if ("augeas" in a or a == "ga5xauvu1kusnsc5s") else "scrapearchitect"
+
+def actor_has_dates(actor_id):
+    return actor_family(actor_id) == "augeas"
+
 def normalize_actor_id(raw):
     """Accept anything the user pastes and return a valid Apify actor reference, or raise a clear error.
     Handles: owner/name · owner~name · bare 17-char ID · https://apify.com/owner/name[...] ·
@@ -885,13 +1128,19 @@ def _proxy_cfg(prof):
     return {"useApifyProxy": bool(prof.get("use_apify_proxy", False))}
 
 def build_search_input(keywords, per_kw, track_limit, prof):
-    return {"terms": list(keywords), "maxItems": int(per_kw), "expand": True,
-            "maxTracks": int(track_limit), "pageSize": 50, "proxyConfiguration": _proxy_cfg(prof)}
+    ft = bool(prof.get("fetch_tracks", True))
+    if actor_family(prof.get("actor_id")) == "augeas":
+        return {"terms": list(keywords), "maxItems": int(per_kw), "expand": ft,
+                "maxTracks": int(track_limit) if ft else 0, "pageSize": int(min(50, max(1, per_kw))), "proxyConfiguration": _proxy_cfg(prof)}
+    return {"searchMode": "keyword", "keywords": list(keywords), "maxResults": int(per_kw),
+            "fetchDetails": True, "trackLimit": int(track_limit) if ft else 1, "proxyCountry": "US"}
 
 def build_url_input(urls, track_limit, prof, plain=False):
-    # Apify's standard "Start URLs" field takes [{"url": ...}]; `plain` sends bare strings as a fallback.
-    return {"startUrls": (list(urls) if plain else [{"url": u} for u in urls]),
-            "maxTracks": int(track_limit), "proxyConfiguration": _proxy_cfg(prof)}
+    if actor_family(prof.get("actor_id")) == "augeas":
+        # Apify's standard "Start URLs" field takes [{"url": ...}]; `plain` sends bare strings as a fallback.
+        return {"startUrls": (list(urls) if plain else [{"url": u} for u in urls]),
+                "maxTracks": int(track_limit), "proxyConfiguration": _proxy_cfg(prof)}
+    return {"searchMode": "url", "urls": list(urls), "fetchDetails": True, "trackLimit": int(track_limit), "proxyCountry": "US"}
 
 def _first(d, *keys, default=""):
     for k in keys:
@@ -1054,9 +1303,15 @@ def propagate_sibling_contacts(df):
                 updated += 1
     return df, updated
 
-def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
-    """Run the actor (keyword search or URL list), normalize, filter, sweep contacts,
-    owner-pivot. Mutates + returns df and a summary string. Raises on Apify failure."""
+def _richness(row):
+    """How much real data a normalized row carries — used to keep the best of duplicate records."""
+    return (int(safe_int(row.get("Saves")) > 0) * 4 + int(safe_int(row.get("Track Count")) > 0) * 2
+            + int(safe_int(row.get("Median Playcount")) > 0) * 2 + int(pd.notna(row.get("Last Added"))) * 3
+            + int(bool(str(row.get("Description", "")).strip())))
+
+def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None, dataset_id=None):
+    """Run the actor (keyword search or URL list) — or import an already-finished run via dataset_id —
+    then normalize, filter, sweep contacts, owner-pivot. Mutates + returns df and a summary. Raises on Apify failure."""
     from apify_client import ApifyClient
     client = ApifyClient(token)
     actor = normalize_actor_id(prof.get("actor_id"))
@@ -1066,26 +1321,52 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     else:
         run_input, total, label = build_search_input(keywords, per_kw, tl, prof), per_kw * len(keywords), "Searching Spotify (full details)"
     cap = float(prof.get("max_usd_per_run", 0.0) or 0)
-    report(0.0, f"Starting {actor}" + (f" (cap ${cap:.2f})" if cap else "") + "…")
-    status, dataset_id = run_apify_and_poll(client, actor, run_input, total, report, label, max_usd=cap or None, max_items=total)
-    if status != "SUCCEEDED" and urls:
-        # startUrls shape fallback: some actors want bare strings instead of {"url": ...}
-        report(0.1, "Retrying URL mode with plain URL strings…")
-        status, dataset_id = run_apify_and_poll(client, actor, build_url_input(urls, tl, prof, plain=True), total, report, label, max_usd=cap or None, max_items=total)
-    if status != "SUCCEEDED":
-        raise RuntimeError(f"Apify run ended with status: {status}")
+    if dataset_id:
+        report(0.5, f"Importing run results — dataset {dataset_id}…")
+    else:
+        report(0.0, f"Starting {actor}" + (f" (cap ${cap:.2f})" if cap else "") + "…")
+        status, dataset_id = run_apify_and_poll(client, actor, run_input, total, report, label, max_usd=cap or None, max_items=total, timeout_min=prof.get("run_timeout_min", 6))
+        if status != "SUCCEEDED" and urls:
+            report(0.1, "Retrying URL mode with plain URL strings…")
+            status, dataset_id = run_apify_and_poll(client, actor, build_url_input(urls, tl, prof, plain=True), total, report, label, max_usd=cap or None, max_items=total, timeout_min=prof.get("run_timeout_min", 6))
+        if status != "SUCCEEDED":
+            raise RuntimeError(f"Apify run ended with status: {status}")
     report(0.97, "Filtering, sweeping contacts, scoring…")
 
+    items = list(client.dataset(dataset_id).iterate_items())
+    return ingest_items(df, seen, blocked, prof, items, keywords, urls)
+
+def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
+    """Shared pipeline for both engines: normalize → keep richest per playlist → filter → sweep → owner-pivot → summary."""
+    class _DS:  # tiny adapter so the existing loop below can iterate a plain list
+        def __init__(self, it): self.it = it
+        def iterate_items(self): return iter(self.it)
+    client = type("C", (), {"dataset": staticmethod(lambda _id: _DS(items))})()
+    dataset_id = "items"
     raw_sample, rows = None, []
     existing = set(df["Playlist_ID"].astype(str))
-    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "blank": 0, "nocontact": 0}
+    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "blank": 0, "nocontact": 0, "records": 0, "merged": 0}
     kw_label = ", ".join(keywords) if keywords else "url"
+    # Pass 1: normalize every record and keep the RICHEST record per playlist (actors often emit a thin
+    # search record and a full expanded record for the same playlist).
+    best = {}
     for item in client.dataset(dataset_id).iterate_items():
-        if raw_sample is None:
+        stats["records"] += 1
+        if not isinstance(item, dict):
+            continue
+        if raw_sample is None or (_richness(normalize_playlist_item(item, "", prof) or {}) > _richness(normalize_playlist_item(raw_sample, "", prof) or {})):
             raw_sample = item
-        row = normalize_playlist_item(item, item.get("query", kw_label) if isinstance(item, dict) else kw_label, prof)
+        row = normalize_playlist_item(item, item.get("query", item.get("keyword", kw_label)), prof)
         if not row or not row["Playlist_ID"]:
             continue
+        pid = row["Playlist_ID"]
+        if pid in best:
+            stats["merged"] += 1
+            if _richness(row) > _richness(best[pid]):
+                best[pid] = row
+        else:
+            best[pid] = row
+    for row in best.values():
         stats["seen"] += 1
         if row["Is Editorial"]:
             stats["editorial"] += 1; continue
@@ -1117,7 +1398,8 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     st.session_state["_raw_sample"] = raw_sample
     contactable = sum(1 for r in rows if r["Contact Tier"] in ("A", "B"))
     nc = f"{stats['nocontact']} discarded (no contact)" if not prof.get("keep_no_contact", True) else f"{stats['nocontact']} with no contact yet (hidden by default in Playlists)"
-    summary = (f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
+    rec = f"{stats['records']} records → {stats['seen']} unique playlists" + (f" ({stats['merged']} duplicate records merged, keeping the fuller one)" if stats["merged"] else "") + ". "
+    summary = (rec + f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
                f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
     return df, summary
 
@@ -1186,6 +1468,8 @@ def in_bands(row, prof):
 
 def curator_queue(df, prof):
     """One row per curator: the best-quality contactable, drafted, unpitched playlist per Owner_ID."""
+    if df.empty:
+        return df.copy()
     d = df[df.apply(has_contact, axis=1) & (df["Draft Pitch"].str.strip() != "") & ~df["Pitched"] & ~df["Declined"]].copy()
     if d.empty:
         return d
@@ -1351,10 +1635,16 @@ def page_dashboard():
 def page_discover():
     show_flash()
     st.title("🔎 Discover")
-    st.caption("Search Spotify by keyword. Junk is dropped before it reaches your list; every field is swept for contacts.")
+    st.caption("Search is fast (no tracks). Junk is dropped at the door; every field is swept for contacts. "
+               "Then step 3 enriches ONLY the contactable playlists with saves, artist size and real freshness — one request each.")
     token = get_key("APIFY_API_TOKEN")
-    if not token:
+    use_api = PROF.get("data_source", "spotify_api") == "spotify_api"
+    if use_api and not (get_key("SPOTIFY_CLIENT_ID") and get_key("SPOTIFY_CLIENT_SECRET")):
+        st.error("Spotify Client ID / Secret missing — add them to your secrets (README → free Spotify developer app).")
+    if not use_api and not token:
         st.error("Apify token missing — add it in Settings.")
+    if not token:
+        st.caption("ℹ️ Apify token missing — only the Instagram-bio step needs it.")
 
     with st.container(border=True):
         st.subheader("1 · Search by keywords")
@@ -1366,13 +1656,33 @@ def page_discover():
         keywords = [k.strip() for k in kws_text.splitlines() if k.strip()]
         est = per_kw * len(keywords)
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
-        c2.caption(f"≈ {est} playlists this run · " + (f"**cap ${cap:.2f}**" if cap else "**no spend cap**") + " · one pass: description, owner, followers, tracks with playcounts + added-dates.")
+        _mode = "fast — no tracks; activity estimated from text (years, 'updated weekly')" if not PROF.get("fetch_tracks") else "with tracks (slower)"
+        c2.caption(f"≈ {est} playlists this run · " + (f"**cap ${cap:.2f}**" if cap else "**no spend cap**") + f" · {_mode}.")
         if not (PROF.get("actor_id") or "").strip():
             st.error("No actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
-        if st.button(f"Search Spotify ({len(keywords)} keywords)", type="primary", disabled=not (token and keywords)):
+        can_run = bool(keywords) and (bool(get_key("SPOTIFY_CLIENT_ID") and get_key("SPOTIFY_CLIENT_SECRET")) if use_api else bool(token))
+        if st.button(f"Search Spotify ({len(keywords)} keywords)", type="primary", disabled=not can_run or bool(_active_run_load())):
             PROF["keywords"], PROF["results_per_keyword"] = kws_text, int(per_kw)
             save_profile(PROF)
-            _run_discover(token, keywords=keywords)
+            if use_api:
+                _run_spotify_api(keywords=keywords)
+            else:
+                try:
+                    start_discovery_run(token, PROF, keywords=keywords)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not start the run: {e}")
+        if not use_api:
+            _render_active_run(token)
+
+    with st.expander("Import a finished Apify run (if a tab was closed mid-run)"):
+        st.caption("Apify console → Runs → open the run → Storage tab → copy the **dataset ID** (or paste the run URL). The run's results get imported exactly as if the app had waited for it.")
+        ds_raw = st.text_input("Dataset ID or run URL", key="import_ds")
+        if st.button("Import run", disabled=not (token and ds_raw.strip())):
+            ds = ds_raw.strip()
+            m = re.search(r"datasets/([A-Za-z0-9]{10,})", ds) or re.search(r"([A-Za-z0-9]{17})$", ds)
+            ds = m.group(1) if m else ds
+            _run_discover(token, keywords=[k.strip() for k in (PROF.get("keywords") or "").splitlines() if k.strip()], dataset_id=ds)
 
     with st.container(border=True):
         st.subheader("2 · Add playlists by URL (manual stalking)")
@@ -1380,18 +1690,35 @@ def page_discover():
                    "They're scraped and merged; sibling contacts propagate to that owner's other playlists automatically.")
         urls_text = st.text_area("Spotify playlist URLs, one per line", height=80, key="manual_urls")
         urls = [u.strip() for u in urls_text.splitlines() if "spotify" in u]
-        if st.button(f"Scrape {len(urls)} URL(s)", disabled=not (token and urls)):
-            _run_discover(token, urls=urls)
+        if st.button(f"Scrape {len(urls)} URL(s)", disabled=not urls or bool(_active_run_load())):
+            if use_api:
+                _run_spotify_api(urls=urls)
+            else:
+                try:
+                    start_discovery_run(token, PROF, urls=urls); st.rerun()
+                except Exception as e:
+                    st.error(f"Could not start the run: {e}")
 
     with st.container(border=True):
-        st.subheader("3 · Refresh details for contactable playlists (optional)")
+        st.subheader("3 · Enrich contactable playlists — saves, artist size, real freshness")
         df = st.session_state.df
-        need_det = df[df.apply(has_contact, axis=1) & (df["Saves"] == 0) & ~df["Is Editorial"]] if len(df) else df
-        st.caption(f"{len(need_det)} contactable playlists are missing saves/tracklist (scraped by an earlier build, or added by hand). This fills them in.")
-        n_det = st.number_input("Max playlists this pass", 1, 200, min(25, max(1, len(need_det))), key="n_det")
-        if st.button(f"Fetch details for {min(int(n_det), len(need_det))} playlists", disabled=not (token and len(need_det))):
-            urls = need_det["Playlist URL"].head(int(n_det)).tolist()
-            _run_details(token, urls)
+        need_det = df[df.apply(has_contact, axis=1) & (df["Last Added"].isna()) & ~df["Is Editorial"] & ~df["Declined"]] if len(df) else df
+        st.caption(f"{len(need_det)} contactable playlists haven't been enriched. One request each (50 tracks) fills followers, median plays → Reachability, "
+                   "and newest added-date → Freshness. Only the playlists you might actually pitch — never the junk.")
+        n_det = st.number_input("Max playlists this pass", 1, 500, min(50, max(1, len(need_det))), key="n_det")
+        if st.button(f"Enrich {min(int(n_det), len(need_det))} playlists" + (" (free)" if use_api else ""), disabled=not len(need_det) or (not use_api and not token)):
+            if use_api:
+                progress, status = st.progress(0.0), st.empty()
+                def report(frac, text):
+                    progress.progress(min(1.0, max(0.0, float(frac)))); status.info(text)
+                try:
+                    df2, upd = enrich_with_spotify(st.session_state.df, need_det.head(int(n_det)).index.tolist(), report)
+                    st.session_state.df = ensure_schema(df2); persist(st.session_state.df)
+                    flash("success", f"Enriched {upd} playlists — saves, artist size and freshness filled."); st.rerun()
+                except Exception as e:
+                    status.error(f"Enrichment failed: {e}")
+            else:
+                _run_details(token, need_det["Playlist URL"].head(int(n_det)).tolist())
 
     with st.container(border=True):
         st.subheader("4 · Enrich: Instagram bio → email")
@@ -1426,9 +1753,10 @@ def _run_details(token, urls):
         actor = normalize_actor_id(PROF.get("actor_id"))
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
         tl = int(PROF.get("track_limit", 200))
-        status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF), len(urls), report, "Fetching playlist details", max_usd=cap or None, max_items=len(urls))
+        tmo = PROF.get("run_timeout_min", 6)
+        status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF), len(urls), report, "Fetching playlist details", max_usd=cap or None, max_items=len(urls), timeout_min=tmo)
         if status_ != "SUCCEEDED":
-            status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF, plain=True), len(urls), report, "Fetching playlist details (retry)", max_usd=cap or None, max_items=len(urls))
+            status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF, plain=True), len(urls), report, "Fetching playlist details (retry)", max_usd=cap or None, max_items=len(urls), timeout_min=tmo)
         if status_ != "SUCCEEDED":
             raise RuntimeError(f"Apify run ended with status: {status_}")
         df, updated = st.session_state.df, 0
@@ -1451,12 +1779,77 @@ def _run_details(token, urls):
     except Exception as e:
         status.error(f"Detail fetch failed: {e}")
 
-def _run_discover(token, keywords=None, urls=None):
+def _run_spotify_api(keywords=None, urls=None):
     progress, status = st.progress(0.0), st.empty()
     def report(frac, text):
         progress.progress(min(1.0, max(0.0, float(frac)))); status.info(text)
     try:
-        df2, summary = core_discover(st.session_state.df, seen_playlists, blocked_owners, token, PROF, keywords or [], report, urls=urls)
+        df2, summary = core_discover_spotify(st.session_state.df, seen_playlists, blocked_owners, PROF, keywords or [], report, urls=urls)
+        st.session_state.df = df2; persist(df2)
+        flash("success", summary); st.rerun()
+    except Exception as e:
+        status.error(f"Discovery failed: {e}")
+
+def _finish_active_run(token, run, status, count):
+    """Import whatever the run collected, then clear it."""
+    if count <= 0:
+        _active_run_save(None)
+        if run.get("urls") and not run.get("plain_urls") and status == "FAILED":
+            try:
+                start_discovery_run(token, PROF, urls=run["urls"], plain_urls=True); st.rerun()
+            except Exception as e:
+                flash("error", f"URL run failed twice: {e}")
+        else:
+            flash("error", f"Run ended with status {status} and no results. Check the run in your Apify console.")
+        st.rerun()
+    try:
+        df2, summary = core_discover(st.session_state.df, seen_playlists, blocked_owners, token, PROF, run.get("keywords") or [], lambda f, t: None,
+                                     urls=run.get("urls") or None, dataset_id=run["dataset_id"])
+        st.session_state.df = df2; persist(df2)
+        note = "" if status == "SUCCEEDED" else f" (run ended {status} — imported what was collected)"
+        flash("success", summary + note)
+    except Exception as e:
+        flash("error", f"Import failed: {e} — retry via 'Import a finished Apify run' with dataset {run['dataset_id']}.")
+    _active_run_save(None)
+    st.rerun()
+
+def _render_active_run(token):
+    if not _active_run_load():
+        return
+    @st.fragment(run_every=3.0)
+    def _panel():
+        r = _active_run_load()
+        if not r:
+            st.rerun(); return
+        try:
+            status, count = poll_discovery_run(token, r)
+        except Exception as e:
+            status, count = "UNKNOWN", 0
+            st.warning(f"Polling error: {e}")
+        elapsed = int(time.time() - r["started"]); limit = int(r.get("timeout_min", 6) * 60)
+        st.progress(min(1.0, elapsed / max(1, limit)), text=f"{status} · {count} records · ~{r['total']} playlists asked · {elapsed}s of {limit}s hard limit")
+        if count > r["total"] * 1.5:
+            st.caption("More records than playlists asked for — duplicates are merged on import; the runaway guard stops the run if it keeps climbing.")
+        guard = float(PROF.get("runaway_factor", 2.5) or 0)
+        if guard and count > r["total"] * guard and status not in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+            abort_discovery_run(token, r); time.sleep(2)
+            flash("warning", f"Runaway guard: the actor produced {count} records for {r['total']} playlists asked — run stopped and results imported.")
+            _finish_active_run(token, r, "ABORTED", count)
+        c1, c2 = st.columns([1, 3])
+        if c1.button("⛔ Stop & import what's collected", type="primary", key=f"stop_{r['run_id']}"):
+            abort_discovery_run(token, r); time.sleep(2)
+            _finish_active_run(token, r, "ABORTED", count)
+        c2.caption(f"Run `{r['run_id']}` · Apify kills it at the hard limit; whatever it collected is imported either way.")
+        if status in ("SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"):
+            _finish_active_run(token, r, status, count)
+    _panel()
+
+def _run_discover(token, keywords=None, urls=None, dataset_id=None):
+    progress, status = st.progress(0.0), st.empty()
+    def report(frac, text):
+        progress.progress(min(1.0, max(0.0, float(frac)))); status.info(text)
+    try:
+        df2, summary = core_discover(st.session_state.df, seen_playlists, blocked_owners, token, PROF, keywords or [], report, urls=urls, dataset_id=dataset_id)
         st.session_state.df = df2
         persist(df2)
         flash("success", summary)
@@ -1658,11 +2051,14 @@ def page_playlists():
     only_bands = h2.checkbox("Only inside my saves + lane bands", value=False)
 
     v = df.copy()
-    if hide_nc and not tier.startswith("Needs"): v = v[v.apply(has_contact, axis=1)]
+    def rowmask(frame, fn):
+        # .apply on an EMPTY frame returns a DataFrame, and filtering by it drops every column — guard it.
+        return frame.apply(fn, axis=1).astype(bool) if len(frame) else pd.Series(False, index=frame.index, dtype=bool)
+    if hide_nc and not tier.startswith("Needs"): v = v[rowmask(v, has_contact)]
     if tier.startswith("A ·"): v = v[v["Contact Tier"] == "A"]
     elif tier.startswith("B ·"): v = v[v["Contact Tier"] == "B"]
     elif tier.startswith("Needs"):
-        v = v[~v.apply(has_contact, axis=1) & ~v["Is Editorial"]].sort_values("Invites Subs", ascending=False)
+        v = v[~rowmask(v, has_contact) & ~v["Is Editorial"]].sort_values("Invites Subs", ascending=False)
         st.info(f"{int(v['Invites Subs'].sum())} of these INVITE submissions but hid the contact — start your manual stalking there (listed first).")
     if lane != "All": v = v[v["Reachability"] == lane]
     if cost != "All": v = v[v["Cost Tag"] == cost]
@@ -1671,7 +2067,7 @@ def page_playlists():
     if search:
         s = search.lower()
         v = v[v["Playlist Name"].str.lower().str.contains(s, na=False) | v["Owner Name"].str.lower().str.contains(s, na=False) | v["Description"].str.lower().str.contains(s, na=False)]
-    if only_bands: v = v[v.apply(lambda r: in_bands(r, PROF), axis=1)]
+    if only_bands: v = v[rowmask(v, lambda r: in_bands(r, PROF))]
     st.caption(f"{len(v)} of {len(df)} playlists · {v.loc[v['Owner_ID'].apply(is_valid_data), 'Owner_ID'].nunique()} curators")
 
     show_cols = ["🗑️ Block", "❌ Remove", "Pitched", "Replied", "Added", "Playlist Name", "Owner Name", "Saves", "Track Count", "Last Added",
@@ -1762,10 +2158,27 @@ def page_settings():
         PROF["one_liner"] = b.text_input("One line about you / the track (used in the pitch prompt)", PROF.get("one_liner", ""))
 
     with st.container(border=True):
+        st.subheader("Data source")
+        PROF["data_source"] = st.radio("Where playlist data comes from", ["spotify_api", "apify"],
+                                       index=0 if PROF.get("data_source", "spotify_api") == "spotify_api" else 1, horizontal=True,
+                                       format_func=lambda v: "Spotify Web API — free, official (recommended)" if v == "spotify_api" else "Apify actor (paid)")
+        if PROF["data_source"] == "spotify_api":
+            ok = bool(get_key("SPOTIFY_CLIENT_ID") and get_key("SPOTIFY_CLIENT_SECRET"))
+            st.caption(("✅ Spotify credentials found." if ok else "❌ Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to your Streamlit secrets — free developer app, 5 minutes (README).")
+                       + " Search is free and paced by the app; step 3 enrichment (saves, popularity, added-dates) is free too.")
+    if PROF.get("data_source") == "apify":
+      with st.container(border=True):
         st.subheader("Apify actor")
         a, b = st.columns([4, 1], vertical_alignment="bottom")
-        PROF["actor_id"] = a.text_input("Spotify Playlists actor", PROF.get("actor_id") or "augeas/spotify-playlists",
-                                        help="Default: https://apify.com/augeas/spotify-playlists. Only change this if you switch actors.")
+        PROF["actor_id"] = a.text_input("Actor (slug, ID or Apify URL)", PROF.get("actor_id") or ACTOR_AUGEAS,
+                                        help="Two supported actors, auto-detected from the slug:\n"
+                                             "• augeas/spotify-playlists — RENTAL (monthly fee paid to the developer; NOT covered by free platform credit). Only actor with added-dates → real Freshness.\n"
+                                             "• ScrapeArchitect Spotify Playlist Scraper — pay-per-result (runs on free credit). Followers + tracklist w/ popularity; no dates → Freshness shows curator claims only.")
+        if actor_family(PROF.get("actor_id")) == "augeas":
+            st.caption("⚠️ `augeas/spotify-playlists` is a **rental** actor: rent it in the Apify console first (its free trial has expired on your account). "
+                       "Not rented? Paste the ScrapeArchitect Spotify Playlist Scraper's URL instead — it runs on your $5 credit, minus added-dates.")
+        else:
+            st.caption("Pay-per-result actor — runs on platform credit. No added-dates, so Freshness = the curator's own claim. Reachability uses Spotify popularity scores.")
         if b.button("Check actor", width="stretch", disabled=not (get_key("APIFY_API_TOKEN") and (PROF.get("actor_id") or "").strip())):
             try:
                 aid, title = check_actor(get_key("APIFY_API_TOKEN"), PROF["actor_id"])
@@ -1795,8 +2208,14 @@ def page_settings():
     with st.expander("Advanced"):
         c1, c2, c3 = st.columns(3)
         PROF["results_per_keyword"] = c1.number_input("Default results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5)
-        PROF["track_limit"] = c2.number_input("Tracks fetched per playlist", 50, 1000, int(PROF.get("track_limit", 200)), step=50,
-                                              help="Freshness = newest added-date among fetched tracks; new adds sit at the end, so fetch enough to reach it.")
+        PROF["run_timeout_min"] = c1.number_input("Hard time limit per run (minutes)", 1, 60, int(PROF.get("run_timeout_min", 6)),
+                                                  help="Apify kills the run at this point. Whatever it collected is imported anyway.")
+        PROF["runaway_factor"] = c1.number_input("Runaway guard (× playlists asked, 0 = off)", 0.0, 10.0, float(PROF.get("runaway_factor", 2.5)), step=0.5,
+                                                 help="If the actor writes more records than asked × this factor, the app aborts the run and imports what it has.")
+        PROF["fetch_tracks"] = st.checkbox("Fetch tracks during the wide SEARCH (slow — off by default)", value=bool(PROF.get("fetch_tracks", False)),
+                                           help="Leave off. Search stays fast; Discover → step 3 fetches tracks (one request each) only for contactable playlists, which is where saves, artist size and real freshness matter.")
+        PROF["track_limit"] = c2.number_input("Tracks fetched per playlist (50 = one request)", 50, 1000, int(PROF.get("track_limit", 50)), step=50,
+                                              help="50 = one API request per playlist and enough for both signals. Raise only if you see active playlists marked Dormant.")
         PROF["dump_bin_tracks"] = c3.number_input("Dump-bin threshold (tracks)", 50, 5000, int(PROF["dump_bin_tracks"]), step=50,
                                                   help="Playlists with more tracks than this aren't curated — skipped.")
         d1, d2, d3 = st.columns(3)

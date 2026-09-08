@@ -40,23 +40,31 @@ Token: GitHub → Settings → Developer settings → **Fine-grained tokens** �
 
 The sidebar shows `☁️ All changes saved to GitHub · HH:MM`, a pending count, or an error. There's also a manual **Save to cloud now** button, and a ZIP backup in Settings as belt-and-braces.
 
-## Apify actor — one actor, hardwired
+## Data source — Spotify Web API (free) by default
 
-The app is hardwired to **[augeas/spotify-playlists](https://apify.com/augeas/spotify-playlists)** — search + full details + added-dates. It is pre-filled; the only keys you need are your Apify token and Gemini key (plus GitHub for auto-save).
+Playlist discovery uses Spotify's **official Web API** — free, no scraping, no proxies, paced by the app so a run can't run away. It returns description, owner, followers, track count, and per-track **added-dates** (freshness) and **popularity** (artist size). Spotify-owned editorial playlists aren't visible to it — the app skips those anyway.
 
-Why this one: it's the only actor found whose keyword search (`terms`) returns, with `expand` on, **followers, track count, and a tracklist with both `plays` and `addedAt`** — so contacts, saves, Quality, Reachability *and real Freshness* are all filled on the first run, with input keys documented as real JSON (`terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration`). No guessing.
+**Setup (5 minutes, free):**
+1. Go to https://developer.spotify.com/dashboard → Log in → **Create app**.
+2. App name: anything (e.g. `wavy-pitch`). Redirect URI: `http://localhost:8501/` (required by the form, never used). API: Web API. Save.
+3. Open the app → **Settings** → copy **Client ID** and **Client secret**.
+4. Streamlit Cloud → your app → Settings → Secrets → add:
+   ```toml
+   SPOTIFY_CLIENT_ID     = "..."
+   SPOTIFY_CLIENT_SECRET = "..."
+   ```
 
-- **Tracks per playlist** (default 200): Freshness = newest added-date among fetched tracks, and new adds usually sit at the *end* of a playlist, so fetch enough to reach it. Dump-bins over your threshold are skipped anyway.
-- **Proxy**: the actor defaults to no proxy (it uses Spotify's API). Leave off unless runs get blocked — proxy bandwidth is billed extra.
-- **Spend cap**: off by default (Settings). If set, Apify aborts the run at that spend.
+**Flow:** Search (fast — no tracks; activity estimated from text) → Discover step 3 **Enrich** (free — one call per *contactable* playlist fills saves, popularity → Reachability, added-dates → Freshness).
 
-The row mapper stays tolerant to other actors' field names, but the *input* is this actor's, exactly.
+**Optional: Apify actor instead.** Settings → Data source → *Apify actor*. Supports `augeas/spotify-playlists` (rental — monthly fee, not covered by free credit; returns play counts + added-dates) and the ScrapeArchitect Spotify Playlist Scraper (pay-per-result). Runs get a hard time limit, a live Stop button and a runaway guard.
+
+**Instagram** (bio → email) still uses `apify/instagram-profile-scraper` — Instagram blocks self-built scrapers; this one is pay-per-result on free credit and only runs on playlists that have an @handle but no email.
 
 ## Cost (realistic)
 
 | API | Job | ≈ per month |
 |---|---|---|
-| Apify “Spotify Playlists” actor | discovery, one pass with full details | check its Pricing tab; no proxy by default |
+| Spotify Web API | discovery + enrichment | **$0** |
 | Apify Instagram scraper | bio → email, gated | $0.50–1.50 |
 | Gemini Flash | name cleanup | pennies |
 | Claude.ai (free batch loop) | writing pitches | $0 |
