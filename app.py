@@ -968,8 +968,11 @@ def spotify_token(force=False):
     st.session_state["_sp_tok"] = {"access_token": j["access_token"], "exp": time.time() + int(j.get("expires_in", 3600))}
     return j["access_token"]
 
+class SpotifyBadRequest(RuntimeError):
+    pass
+
 def _sp_get(path, params=None, retries=3):
-    """GET with bearer token, 429 back-off, one 401 token refresh."""
+    """GET with bearer token, 429 back-off, one 401 token refresh. Errors include the exact request (no token)."""
     from urllib.parse import urlencode
     url = f"{SPOTIFY_API}{path}" + (("?" + urlencode(params)) if params else "")
     for attempt in range(retries + 1):
@@ -985,15 +988,27 @@ def _sp_get(path, params=None, retries=3):
             return None  # e.g. Spotify-owned playlists are hidden from dev-mode apps — we skip those anyway
         if status >= 500 and attempt < retries:
             time.sleep(1.5); continue
-        raise RuntimeError(f"Spotify API {status} on {path}: {(j or {}).get('error', j)}")
+        err = (j or {}).get("error", j)
+        msg = f"Spotify API {status} on {url}: {err}"
+        raise SpotifyBadRequest(msg) if status == 400 else RuntimeError(msg)
     return None
 
 def spotify_search_playlists(term, limit):
-    """Simplified playlist objects for a search term (paginates 50 at a time)."""
+    """Simplified playlist objects for a search term. Pages of ≤50; if Spotify rejects the page size
+    ('Invalid limit'), steps down 50 → 20 → 10 → 5 → 1 automatically."""
+    limit = max(1, int(limit))
     out, offset = [], 0
+    page_size = min(50, limit)
     while len(out) < limit:
-        page = min(50, limit - len(out))
-        j = _sp_get("/search", {"q": term, "type": "playlist", "limit": page, "offset": offset})
+        page = max(1, min(page_size, limit - len(out)))
+        try:
+            j = _sp_get("/search", {"q": term, "type": "playlist", "limit": int(page), "offset": int(offset)})
+        except SpotifyBadRequest as e:
+            smaller = next((p for p in (20, 10, 5, 1) if p < page), None)
+            if "limit" in str(e).lower() and smaller:
+                page_size = smaller
+                continue
+            raise
         items = ((j or {}).get("playlists") or {}).get("items") or []
         items = [i for i in items if i]  # Spotify sometimes returns nulls in the list
         if not items:
