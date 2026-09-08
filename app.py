@@ -505,8 +505,9 @@ def extract_ig_username(ig_url):
         return m.group(1).split("?")[0].strip("/")
     return str(ig_url).replace("@", "").strip()
 
-SUBMISSION_PLATFORMS = r'(?:sbmt\.to|submithub|groover|musosoup|playlistpush|upnextapp|dailyplaylists|soundcampaign|indiemono|submit\.link|linktr\.ee|forms\.gle|docs\.google\.com/forms|typeform|beacons\.ai|bio\.link)'
-SUBMISSION_LINK_RE = re.compile(r'((?:https?://)?(?:www\.)?[^\s<>"\']*' + SUBMISSION_PLATFORMS + r'[^\s<>"\']*)', re.IGNORECASE)
+SUBMISSION_PLATFORMS = (r'(?:sbmt\.to|submithub\.com|groover\.co|musosoup\.com|playlistpush\.com|upnextapp\.io|dailyplaylists\.com|soundcampaign\.com|indiemono\.com'
+                        r'|submit\.link|linktr\.ee|forms\.gle|docs\.google\.com/forms|typeform\.com|beacons\.ai|bio\.link|soundplate\.com|votedbyyou\.com)')
+SUBMISSION_LINK_RE = re.compile(r'((?:https?://)?(?:www\.)?[A-Za-z0-9.-]*' + SUBMISSION_PLATFORMS + r'[^\s<>"\']*)', re.IGNORECASE)
 BARE_DOMAIN_RE = re.compile(r'^(?:https?://)?(?:www\.)?([a-z0-9-]+\.(?:com|net|io|co|app|fm|to|link|me|org|music))(?:/\S*)?$', re.IGNORECASE)
 PAID_RE = re.compile(r'(sbmt\.to|submithub|groover|musosoup|playlist\s*push|upnextapp|dailyplaylists|soundcampaign|\$\s?\d|\d\s?(usd|eur|€|£)|paid\s*(promo|placement|submission)|\bfee\b|pay\s*to\s*(play|submit))', re.IGNORECASE)
 INTENT_RE = re.compile(
@@ -1009,12 +1010,13 @@ def spotify_search_playlists(term, limit):
                 page_size = smaller
                 continue
             raise
-        items = ((j or {}).get("playlists") or {}).get("items") or []
-        items = [i for i in items if i]  # Spotify sometimes returns nulls in the list
-        if not items:
-            break
-        out.extend(items); offset += len(items)
-        if len(items) < page:
+        pl = (j or {}).get("playlists") or {}
+        raw = pl.get("items") or []
+        items = [i for i in raw if i]  # Spotify returns nulls inside pages — drop them but DON'T treat that as "last page"
+        out.extend(items)
+        offset += max(len(raw), 1)
+        st.session_state["_sp_page_size"] = page
+        if not raw or not pl.get("next"):   # Spotify says there is no next page
             break
         time.sleep(SPOTIFY_PACE_SECS)
     return out[:limit]
@@ -1273,7 +1275,7 @@ def normalize_playlist_item(item, keyword, prof):
         "Quality Score": quality_score(saves, tracks_n, desc, prof),
         "Email Address": c["email"] or "None Found", "Instagram": c["instagram"] or "None",
         "Submission Link": c["link"], "Contact Source": c["source"], "Contact Confidence": c["confidence"],
-        "Is Editorial": owner_id.lower() == "spotify" or owner_name_n.lower() == "spotify",
+        "Is Editorial": owner_id.lower() in ("spotify", "thesoundsofspotify", "everynoise") or owner_name_n.lower() in ("spotify", "the sounds of spotify", "every noise at once"),
         "Is Dump Bin": tracks_n > int(prof.get("dump_bin_tracks", 500)),
         "Invites Subs": bool(has_submission_intent(name, desc)),
         "Declined": bool(refuses_submissions(name, desc)),
@@ -1381,18 +1383,20 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
                 best[pid] = row
         else:
             best[pid] = row
+    skipped = []  # (reason, row) — shown to the user after the run so the filters can be audited
+    def skip(reason, row):
+        skipped.append({"reason": reason, "playlist": row["Playlist Name"], "owner": row["Owner Name"], "saves": row["Saves"],
+                        "description": (row["Description"] or "")[:160], "url": row["Playlist URL"]})
     for row in best.values():
         stats["seen"] += 1
         if row["Is Editorial"]:
-            stats["editorial"] += 1; continue
+            stats["editorial"] += 1; skip("editorial (Spotify-owned)", row); continue
         if not urls and prof.get("skip_instrumental", True) and looks_instrumental(row["Playlist Name"], row["Description"], prof.get("exclude_words", "")):
-            stats["instrumental"] += 1; seen.add(row["Playlist_ID"]); continue
+            stats["instrumental"] += 1; seen.add(row["Playlist_ID"]); skip("type-beat / instrumental", row); continue
         if not urls and prof.get("skip_mainstream", True) and looks_mainstream(row["Playlist Name"], row["Description"]):
-            stats["mainstream"] += 1; seen.add(row["Playlist_ID"]); continue
-        if not urls and prof.get("skip_blank", True) and row["Contact Tier"] == "C" and not row["Invites Subs"] and not normalize_text(row["Description"]).strip():
-            stats["blank"] += 1; seen.add(row["Playlist_ID"]); continue
+            stats["mainstream"] += 1; seen.add(row["Playlist_ID"]); skip("famous-artist / chart", row); continue
         if row["Owner_ID"] in blocked:
-            stats["blocked"] += 1; continue
+            stats["blocked"] += 1; skip("blocked curator", row); continue
         if row["Playlist_ID"] in existing or row["Playlist_ID"] in seen:
             stats["dup"] += 1; seen.add(row["Playlist_ID"]); continue
         seen.add(row["Playlist_ID"]); existing.add(row["Playlist_ID"])
@@ -1402,6 +1406,15 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
         new_ids = {r["Playlist_ID"] for r in rows}
         df = ensure_schema(pd.concat([df, pd.DataFrame(rows)], ignore_index=True))
         df, sib = propagate_sibling_contacts(df)
+        # Blank playlists (no description, no contact, no invite) are dropped only NOW — after a sibling
+        # "Submit Your Music" playlist from the same curator has had the chance to supply a contact.
+        if not urls and prof.get("skip_blank", True):
+            blank = (df["Playlist_ID"].isin(new_ids) & (df["Contact Tier"] == "C") & ~df["Invites Subs"]
+                     & (df["Description"].apply(lambda d: not normalize_text(d).strip())))
+            for _, r in df[blank].iterrows():
+                skip("blank (no description, no contact)", r)
+            stats["blank"] = int(blank.sum()); stats["kept"] -= stats["blank"]
+            df = df.drop(index=df.index[blank]).reset_index(drop=True)
         if not urls and not prof.get("keep_no_contact", True):
             drop = df.index[df["Playlist_ID"].isin(new_ids) & (df["Contact Tier"] == "C")]
             stats["nocontact"] = int(len(drop)); df = df.drop(index=drop).reset_index(drop=True); stats["kept"] -= stats["nocontact"]
@@ -1411,11 +1424,14 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
         sib = 0
     save_json_set(seen, SEEN_PLAYLISTS_FILE)
     st.session_state["_raw_sample"] = raw_sample
+    st.session_state["_last_skipped"] = skipped
     contactable = sum(1 for r in rows if r["Contact Tier"] in ("A", "B"))
     nc = f"{stats['nocontact']} discarded (no contact)" if not prof.get("keep_no_contact", True) else f"{stats['nocontact']} with no contact yet (hidden by default in Playlists)"
     rec = f"{stats['records']} records → {stats['seen']} unique playlists" + (f" ({stats['merged']} duplicate records merged, keeping the fuller one)" if stats["merged"] else "") + ". "
+    hint = (" Nothing new: the same keywords return the same top results — raise 'Results per keyword' to reach the next pages, or add new keywords."
+            if stats["kept"] == 0 and stats["dup"] > 0 else "")
     summary = (rec + f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
-               f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
+               f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked." + hint)
     return df, summary
 
 def core_scrape_instagram(df, igs_set, token, report):
@@ -1672,6 +1688,8 @@ def page_discover():
         est = per_kw * len(keywords)
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
         _mode = "fast — no tracks; activity estimated from text (years, 'updated weekly')" if not PROF.get("fetch_tracks") else "with tracks (slower)"
+        if st.session_state.get("_sp_page_size"):
+            _mode += f" · Spotify page size {st.session_state['_sp_page_size']}"
         c2.caption(f"≈ {est} playlists this run · " + (f"**cap ${cap:.2f}**" if cap else "**no spend cap**") + f" · {_mode}.")
         if not (PROF.get("actor_id") or "").strip():
             st.error("No actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
@@ -1753,6 +1771,12 @@ def page_discover():
             except Exception as e:
                 status.error(f"Instagram scrape failed: {e}")
 
+    sk = st.session_state.get("_last_skipped") or []
+    if sk:
+        with st.expander(f"🗂 What the last run skipped, and why ({len(sk)}) — audit the filters"):
+            st.caption("If something here should NOT have been skipped, tell me the row — the rule that caught it gets tuned. Blocked/editorial rows are never re-evaluated; the rest are remembered so they're not re-fetched.")
+            skdf = pd.DataFrame(sk)
+            st.dataframe(skdf, width="stretch", height=380, column_config={"url": st.column_config.LinkColumn(display_text="open")})
     if st.session_state.get("_raw_sample") is not None:
         with st.expander("🔬 Raw sample from the last actor run (for checking field names)"):
             st.json(st.session_state["_raw_sample"])
