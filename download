@@ -1,0 +1,16 @@
+# App data — never on main. The app pushes it to the `app-data` branch itself.
+wavy_pitch_db.csv
+seen_playlists.json
+blocked_owners.json
+scraped_igs.json
+my_profile.json
+.cloud_state.json
+.cloud_restored
+.cloud_branch_ok
+
+# Secrets
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+.DS_Store

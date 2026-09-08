@@ -1,0 +1,10 @@
+# WAVYMIXING brand theme — studio dark (same as Wavy Outreach)
+[theme]
+base = "dark"
+primaryColor = "#F0A93B"
+backgroundColor = "#0A0A0C"
+secondaryBackgroundColor = "#151518"
+textColor = "#F4F2ED"
+
+[browser]
+gatherUsageStats = false
