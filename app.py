@@ -530,7 +530,8 @@ def refuses_submissions(*texts):
 # A curator's own website in the description is a door too (it'll have a contact page).
 # Skip platforms that aren't contacts: Spotify itself, YouTube, Apple, image/CDN links.
 NON_CONTACT_DOMAINS = re.compile(r"(spotify\.com|spoti\.fi|youtube\.com|youtu\.be|music\.apple\.com|apple\.com|scdn\.co|i\.scdn|freepik|unsplash|pexels|giphy|imgur|wikipedia\.org|google\.com/search"
-                                 r"|lnk\.to|linkfire|ffm\.to|fanlink|song\.link|hypeddit|distrokid|ditto|deezer|tidal|amazon\.|soundcloud\.com/[^/]+/sets)", re.I)
+                                 r"|lnk\.to|linkfire|ffm\.to|fanlink|song\.link|hypeddit|distrokid|ditto|deezer|tidal|amazon\.|soundcloud\.com/[^/]+/sets"
+                                 r"|tunemymusic|soundiiz|instagram\.com)", re.I)
 WEBSITE_RE = re.compile(r"((?:https?://|www\.)[^\s<>\"'()\[\]]+|\b(?!e\.g\b)[a-z0-9-]{2,}(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|co|me|fm|link|app|music|xyz|site|page|store|shop|band|rocks)\b(?:/[^\s<>\"'()\[\]]*)?)", re.I)
 
 def extract_website(text):
@@ -937,7 +938,7 @@ def show_flash():
 # ----------------------------------------------------------------------------
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API = "https://api.spotify.com/v1"
-SPOTIFY_PACE_SECS = 0.25  # gentle pacing keeps us well inside Spotify's rolling rate limit
+SPOTIFY_PACE_SECS = 0.35  # gentle pacing keeps us inside Spotify's rolling 30-second rate limit (dev-mode apps get the lower tier)
 
 def _http_json(url, method="GET", headers=None, data=None, timeout=30):
     """Small urllib wrapper. Returns (status, json_or_None, headers)."""
@@ -984,7 +985,11 @@ def _sp_get(path, params=None, retries=3):
             spotify_token(force=True); continue
         if status == 429:
             wait = int((hdrs.get("Retry-After") or hdrs.get("retry-after") or 2))
-            time.sleep(min(wait, 30)); continue
+            if wait > 60 or attempt >= retries:
+                mins = max(1, round(wait / 60))
+                raise RuntimeError(f"Spotify rate limit reached — it asks you to wait ~{mins} minute(s) before retrying. "
+                                   "Nothing is lost: what was collected so far is kept; run again after the wait.")
+            time.sleep(wait); continue
         if status in (404, 403):
             return None  # e.g. Spotify-owned playlists are hidden from dev-mode apps — we skip those anyway
         if status >= 500 and attempt < retries:
@@ -1434,6 +1439,56 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
                f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked." + hint)
     return df, summary
 
+def reapply_rules(df, prof):
+    """Re-run today's contact sweep + tier/cost/intent rules over rows already in the DB (they were scraped under
+    older rules), and drop rows the current skip filters would never have let in. Manual contacts are never touched.
+    Free and local. Returns (df, summary)."""
+    if df.empty:
+        return df, "Nothing to re-apply."
+    df = df.copy()
+    fixed, retiered, declined, removed = 0, 0, 0, []
+    def bad_link(v):
+        v = str(v or "").strip()
+        return bool(v) and (v.endswith(":") or not re.match(r"^https?://[A-Za-z0-9.-]+\.[a-z]{2,}(/|$|\?)", v, re.I) or NON_CONTACT_DOMAINS.search(v))
+    for i in df.index:
+        r = df.loc[i]
+        if not r["Pitched"] and not r["Added"] and str(r["Contact Source"]) != "manual" and str(r["Keyword"]) != "manual":
+            if r["Is Editorial"] or looks_instrumental(r["Playlist Name"], r["Description"], prof.get("exclude_words", "")) or looks_mainstream(r["Playlist Name"], r["Description"]):
+                removed.append(i); continue
+        if str(r["Contact Source"]) != "manual":
+            c = sweep_contacts(r["Owner Name"], r["Playlist Name"], r["Description"])
+            changed = False
+            if c["email"] and not is_valid_data(r["Email Address"]):
+                df.at[i, "Email Address"] = c["email"]; changed = True
+            if c["instagram"] and not is_valid_data(r["Instagram"]):
+                df.at[i, "Instagram"] = c["instagram"]; changed = True
+            if bad_link(r["Submission Link"]):
+                df.at[i, "Submission Link"] = c["link"] or ""; changed = True
+            elif c["link"] and not str(r["Submission Link"]).strip():
+                df.at[i, "Submission Link"] = c["link"]; changed = True
+            if changed:
+                fixed += 1
+                if c["source"]:
+                    df.at[i, "Contact Source"] = c["source"]; df.at[i, "Contact Confidence"] = max(safe_int(r["Contact Confidence"]), c["confidence"])
+        tier = contact_tier(df.at[i, "Email Address"], df.at[i, "Instagram"], df.at[i, "Submission Link"], r["Playlist Name"], r["Description"])
+        if tier != r["Contact Tier"]:
+            df.at[i, "Contact Tier"] = tier; retiered += 1
+        df.at[i, "Invites Subs"] = bool(has_submission_intent(r["Playlist Name"], r["Description"]))
+        ctag = cost_tag_for(r["Playlist Name"], r["Description"], df.at[i, "Submission Link"])
+        if ctag == "paid-link":
+            df.at[i, "Cost Tag"] = "paid-link"
+        elif tier in ("A", "B") and df.at[i, "Cost Tag"] == "unknown":
+            df.at[i, "Cost Tag"] = "free"
+        if not r["Pitched"] and not r["Declined"] and refuses_submissions(r["Playlist Name"], r["Description"]):
+            df.at[i, "Declined"] = True; df.at[i, "Notes"] = "Curator says: no submissions — auto-declined."; declined += 1
+        if r["Reachability"] == "Unknown" and looks_mainstream(r["Playlist Name"], r["Description"]):
+            df.at[i, "Reachability"] = "Skip (superstars)"
+    if removed:
+        df = df.drop(index=removed).reset_index(drop=True)
+    df, sib = propagate_sibling_contacts(ensure_schema(df))
+    return ensure_schema(df), (f"Re-applied current rules to {len(df) + len(removed)} rows: {fixed} contacts fixed/added, {retiered} re-tiered, "
+                               f"+{sib} via sibling playlists, {declined} auto-declined ('no submissions'), {len(removed)} removed by today's filters (type-beat / chart / editorial).")
+
 def core_scrape_instagram(df, igs_set, token, report):
     """IG bio → email for playlists that have an @handle but no email. Ported from Wavy."""
     targets, idx_map = [], {}
@@ -1770,6 +1825,13 @@ def page_discover():
                 st.rerun()
             except Exception as e:
                 status.error(f"Instagram scrape failed: {e}")
+
+    with st.expander("🧹 Re-apply current rules to existing playlists (free, local)"):
+        st.caption("The contact sweep and filters keep improving. This re-runs them over what you already have — fixes malformed links, finds contacts the older rules missed, "
+                   "re-tiers, auto-declines 'no submissions' curators, and removes type-beat / chart playlists that predate the filters. Manual contacts and pitched rows are never touched.")
+        if st.button("Re-apply rules now", disabled=st.session_state.df.empty):
+            df2, msg = reapply_rules(st.session_state.df, PROF)
+            st.session_state.df = df2; persist(df2); flash("success", msg); st.rerun()
 
     sk = st.session_state.get("_last_skipped") or []
     if sk:
