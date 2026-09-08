@@ -80,6 +80,10 @@ DEFAULT_PROFILE = {
     "epk_link": "",
     "one_liner": "",
     "keywords": "",
+    "freshness_gate": "exclude_dormant",   # any | exclude_dormant (>1y) | active (≤90d) | fresh (≤30d)
+    "exclude_bot_high": True,              # High bot-risk playlists never enter the pitch queue
+    "skip_promo": True,                    # drop playlists advertising paid promo / guaranteed streams at ingest
+    "require_known_freshness": False,      # True = rows with no date/claim don't enter the queue until enriched
     "saves_min": 1000,
     "saves_max": 200000,
     "lane_min_plays": 50000,
@@ -92,7 +96,8 @@ DEFAULT_PROFILE = {
     "actor_id": "augeas/spotify-playlists",   # only used when data_source == "apify"
     "results_per_keyword": 20,
     "track_limit": 50,               # tracks fetched per playlist = ONE request. Enough for median plays (artist size) and newest addedAt (freshness).
-    "fetch_tracks": False,           # search WITHOUT tracks (fast). Tracks are fetched later, only for contactable playlists (Discover → step 3).
+    "fetch_tracks": False,           # search WITHOUT tracks (fast) — contactable results are enriched automatically right after
+    "auto_enrich": True,             # after every search: enrich the new contactable playlists immediately (saves, artist size, last-added)
     "run_timeout_min": 6,            # HARD limit — Apify kills the run at this point; whatever was collected is imported anyway
     "runaway_factor": 2.5,           # if records exceed (playlists asked × this), the app aborts the run itself and imports
     "use_apify_proxy": False,        # actor default is no proxy (it uses Spotify's API, not page scraping) — proxies are the hidden cost
@@ -128,7 +133,7 @@ COLUMN_ORDER = [
     "Pitched", "Followed Up", "Replied", "Added", "Declined",
     "Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB",
     "Playlist_ID", "Playlist Name", "Playlist URL", "Owner Name", "Owner_ID", "Owner URL",
-    "Saves", "Track Count", "Median Popularity", "Median Playcount", "Last Added", "Freshness", "Description", "Keyword",
+    "Saves", "Track Count", "Median Popularity", "Median Playcount", "Last Added", "Freshness", "Adds 7d", "Bot Risk", "Description", "Keyword",
     "Contact Tier", "Reachability", "Cost Tag", "Fit Score", "Quality Score",
     "Email Address", "Instagram", "Submission Link", "Contact Source", "Contact Confidence",
     "IG Bio", "IG Followers",
@@ -139,14 +144,14 @@ COLUMN_ORDER = [
 TEXT_DEFAULTS = {
     "Playlist_ID": "", "Playlist Name": "", "Playlist URL": "", "Owner Name": "", "Owner_ID": "",
     "Owner URL": "", "Description": "", "Keyword": "",
-    "Contact Tier": "C", "Reachability": "Unknown", "Cost Tag": "unknown", "Freshness": "Unknown",
+    "Contact Tier": "C", "Reachability": "Unknown", "Cost Tag": "unknown", "Freshness": "Unknown", "Bot Risk": "Unknown",
     "Email Address": "None Found", "Instagram": "None", "Submission Link": "",
     "Contact Source": "", "IG Bio": "Not Scanned",
     "Channel": "", "Draft Pitch": "", "Notes": "",
 }
 BOOL_COLS = ["🗑️ Block", "❌ Remove", "Pitched", "Followed Up", "Replied", "Added", "Declined",
              "🔄 Regenerate", "Is Editorial", "Is Dump Bin", "Invites Subs"]
-INT_COLS = ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Fit Score", "Quality Score",
+INT_COLS = ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Adds 7d", "Fit Score", "Quality Score",
             "Contact Confidence", "IG Followers"]
 DATE_COLS = ["Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB", "Last Added"]
 UI_ONLY_COLS = ["🗑️ Block", "❌ Remove"]
@@ -647,6 +652,33 @@ def looks_mainstream(name, description):
     need = 3 if INDIE_SIGNAL_RE.search(t) else 2
     return len(stars) >= need
 
+# ---------- Bot / pay-to-play risk ----------
+# Fake-follower playlists can't be verified directly (Spotify hides listener counts), but three things give them away:
+#   followers wildly out of line with the popularity of the tracks on them, dozens of tracks added per day (churn),
+#   and promo-service language. Text signals apply at ingest; the metric signals apply after enrichment.
+PROMO_RE = re.compile(
+    r"(guaranteed\s+(?:streams?|plays|placement|results)|promo(?:tion)?\s+(?:packages?|services?|deals?)|packages?\s+(?:start|from)|pricing|price\s*list|our\s+rates|dm\s+(?:me\s+|us\s+)?for\s+(?:rates?|prices?|pricing|a\s+quote)"
+    r"|(?:€|\$|£)\s?\d+\s*(?:per|/)\s*(?:track|song|placement|week|month)|\d+\s?(?:€|\$|£|usd|eur)\s*(?:per|/)\s*(?:track|song|placement)|paid\s+(?:placement|promo|promotion|feature)|sponsored\s+(?:placement|slot|spot)"
+    r"|stream(?:s|ing)?\s+(?:boost|guarantee|campaign)|playlist\s+promotion\s+service|paypal|cash\s*app|venmo|usdt|crypto\s+accepted|whatsapp\s+(?:me\s+|us\s+)?for|telegram\s+(?:me\s+|us\s+)?for|fiverr|buy\s+(?:a\s+)?(?:spot|slot|placement)|monthly\s+placement\s+fee)", re.I)
+
+def looks_promo_service(name, description):
+    return bool(PROMO_RE.search(normalize_text(f"{name} {description}")))
+
+def bot_risk(saves, med_pop, adds_7d, name="", description="", cost_tag=""):
+    """'High' / 'Medium' / 'Low' / 'Unknown' (not enriched yet). Conservative on Low: it just means nothing tripped."""
+    if looks_promo_service(name, description):
+        return "High"
+    if med_pop < 0 and not saves:
+        return "Unknown"
+    s, pop, a7 = int(saves or 0), int(med_pop if med_pop is not None else -1), int(adds_7d or 0)
+    if a7 >= 40:
+        return "High"
+    if pop >= 0 and s >= 5000 and pop <= 5:
+        return "High"                      # big audience, nobody artists → bought followers
+    if a7 >= 20 or (pop >= 0 and s >= 20000 and pop <= 12) or cost_tag == "paid-link":
+        return "Medium"
+    return "Low"
+
 # ---------- Freshness ----------
 # Real signal = Last Added (max per-track addedAt) — only some actors return it. When absent,
 # fall back to the curator's own claim ("updated weekly") as a labelled hint, never as fact.
@@ -1085,7 +1117,7 @@ def enrich_with_spotify(df, idxs, report):
         row = normalize_playlist_item(spotify_to_row_item(None, d, "enrich"), "enrich", PROF)
         if not row:
             continue
-        for col in ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Reachability", "Quality Score", "Is Dump Bin"]:
+        for col in ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Reachability", "Quality Score", "Is Dump Bin", "Adds 7d"]:
             if col in ("Saves", "Track Count", "Median Popularity", "Median Playcount") and not row[col]:
                 continue
             df.at[i, col] = row[col]
@@ -1093,6 +1125,8 @@ def enrich_with_spotify(df, idxs, report):
             df.at[i, "Last Added"] = row["Last Added"]
         if not is_valid_data(df.at[i, "Description"]) and row["Description"]:
             df.at[i, "Description"] = row["Description"]
+        df.at[i, "Bot Risk"] = bot_risk(df.at[i, "Saves"], row["Median Popularity"] if row["Median Popularity"] else -1, row["Adds 7d"],
+                                        df.at[i, "Playlist Name"], df.at[i, "Description"], df.at[i, "Cost Tag"])
         updated += 1
         time.sleep(SPOTIFY_PACE_SECS)
     return df, updated
@@ -1237,7 +1271,12 @@ def _tracks_summary(item):
     med = int(median(plays)) if plays else 0
     med_pop = int(median(pops)) if pops else -1
     last = pd.to_datetime(max(added), errors="coerce", utc=True).tz_localize(None) if added else pd.NaT
-    return med, " ".join(dict.fromkeys(artists)), last, med_pop
+    adds_7d = 0
+    if added:
+        ts = pd.to_datetime(pd.Series(added), errors="coerce", utc=True).dropna().dt.tz_localize(None)
+        if len(ts):
+            adds_7d = int((ts >= ts.max() - pd.Timedelta(days=7)).sum())  # adds in the 7 days up to the newest add
+    return med, " ".join(dict.fromkeys(artists)), last, med_pop, adds_7d
 
 def normalize_playlist_item(item, keyword, prof):
     """Map one raw actor item → one schema row. Returns None if it's not a playlist."""
@@ -1262,7 +1301,7 @@ def normalize_playlist_item(item, keyword, prof):
     tracks_n = safe_int(_first(item, "totalTracks", "total_tracks", "trackCount", "totalCount", default=0))
     if not tracks_n and isinstance(item.get("content"), dict):
         tracks_n = safe_int(item["content"].get("totalCount", 0))
-    med_plays, artists_text, last_added, med_pop = _tracks_summary(item)
+    med_plays, artists_text, last_added, med_pop, adds_7d = _tracks_summary(item)
 
     c = sweep_contacts(owner_name_n, name, desc)
     tier = contact_tier(c["email"], c["instagram"], c["link"], name, desc)
@@ -1276,6 +1315,7 @@ def normalize_playlist_item(item, keyword, prof):
         "Reachability": ("Skip (superstars)" if looks_mainstream(name, desc)
                          else (reachability_from_popularity(med_pop, prof) if med_pop >= 0 else reachability_bucket(med_plays, prof))),
         "Median Popularity": med_pop if med_pop >= 0 else 0, "Cost Tag": ctag,
+        "Adds 7d": adds_7d, "Bot Risk": bot_risk(saves, med_pop, adds_7d, name, desc, ctag),
         "Fit Score": fit_score(prof.get("keywords", ""), name, desc, artists_text),
         "Quality Score": quality_score(saves, tracks_n, desc, prof),
         "Email Address": c["email"] or "None Found", "Instagram": c["instagram"] or "None",
@@ -1367,7 +1407,7 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
     dataset_id = "items"
     raw_sample, rows = None, []
     existing = set(df["Playlist_ID"].astype(str))
-    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "blank": 0, "nocontact": 0, "records": 0, "merged": 0}
+    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "promo": 0, "blank": 0, "nocontact": 0, "records": 0, "merged": 0}
     kw_label = ", ".join(keywords) if keywords else "url"
     # Pass 1: normalize every record and keep the RICHEST record per playlist (actors often emit a thin
     # search record and a full expanded record for the same playlist).
@@ -1400,6 +1440,8 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
             stats["instrumental"] += 1; seen.add(row["Playlist_ID"]); skip("type-beat / instrumental", row); continue
         if not urls and prof.get("skip_mainstream", True) and looks_mainstream(row["Playlist Name"], row["Description"]):
             stats["mainstream"] += 1; seen.add(row["Playlist_ID"]); skip("famous-artist / chart", row); continue
+        if not urls and prof.get("skip_promo", True) and looks_promo_service(row["Playlist Name"], row["Description"]):
+            stats["promo"] += 1; seen.add(row["Playlist_ID"]); skip("paid promo / bot signals", row); continue
         if row["Owner_ID"] in blocked:
             stats["blocked"] += 1; skip("blocked curator", row); continue
         if row["Playlist_ID"] in existing or row["Playlist_ID"] in seen:
@@ -1436,7 +1478,7 @@ def ingest_items(df, seen, blocked, prof, items, keywords, urls=None):
     hint = (" Nothing new: the same keywords return the same top results — raise 'Results per keyword' to reach the next pages, or add new keywords."
             if stats["kept"] == 0 and stats["dup"] > 0 else "")
     summary = (rec + f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
-               f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked." + hint)
+               f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['promo']} paid-promo/bot, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked." + hint)
     return df, summary
 
 def reapply_rules(df, prof):
@@ -1483,6 +1525,8 @@ def reapply_rules(df, prof):
             df.at[i, "Declined"] = True; df.at[i, "Notes"] = "Curator says: no submissions — auto-declined."; declined += 1
         if r["Reachability"] == "Unknown" and looks_mainstream(r["Playlist Name"], r["Description"]):
             df.at[i, "Reachability"] = "Skip (superstars)"
+        df.at[i, "Bot Risk"] = bot_risk(r["Saves"], safe_int(r["Median Popularity"]) if safe_int(r["Median Popularity"]) else -1, safe_int(r["Adds 7d"]),
+                                        r["Playlist Name"], r["Description"], df.at[i, "Cost Tag"])
     if removed:
         df = df.drop(index=removed).reset_index(drop=True)
     df, sib = propagate_sibling_contacts(ensure_schema(df))
@@ -1546,11 +1590,29 @@ def core_scrape_instagram(df, igs_set, token, report):
 def has_contact(row):
     return is_valid_data(row["Email Address"]) or is_valid_data(row["Instagram"]) or bool(str(row["Submission Link"]).strip())
 
+FRESH_RANK = {"Fresh (≤30d)": 4, "Active (≤90d)": 3, "Stale (≤1y)": 2, "Dormant (>1y)": 1}
+
+def freshness_rank(label):
+    """4 fresh · 3 active · 2 stale · 1 dormant · 0 unknown. Text-only signals map conservatively:
+    'Mentions <current/last year>' ≈ active, 'Claims: updated…' ≈ active, 'likely stale' ≈ dormant."""
+    lab = str(label or "")
+    if lab in FRESH_RANK: return FRESH_RANK[lab]
+    if "likely stale" in lab: return 1
+    if lab.startswith("Claims:") or lab.startswith("Mentions"): return 3
+    return 0
+
+def passes_freshness(row, prof):
+    gate = prof.get("freshness_gate", "exclude_dormant"); r = freshness_rank(row["Freshness"])
+    if r == 0:
+        return not prof.get("require_known_freshness", False)
+    return {"any": 1, "exclude_dormant": 2, "active": 3, "fresh": 4}.get(gate, 2) <= r
+
 def in_bands(row, prof):
     s = safe_int(row["Saves"])
     ok_saves = (s == 0) or (int(prof["saves_min"]) <= s <= int(prof["saves_max"]))
     ok_lane = row["Reachability"] in ("In your lane", "Stretch", "Unknown")
-    return ok_saves and ok_lane and not row["Is Dump Bin"] and not row["Is Editorial"]
+    ok_bot = not (prof.get("exclude_bot_high", True) and str(row.get("Bot Risk", "")) == "High")
+    return ok_saves and ok_lane and ok_bot and passes_freshness(row, prof) and not row["Is Dump Bin"] and not row["Is Editorial"]
 
 def curator_queue(df, prof):
     """One row per curator: the best-quality contactable, drafted, unpitched playlist per Owner_ID."""
@@ -1788,11 +1850,11 @@ def page_discover():
                     st.error(f"Could not start the run: {e}")
 
     with st.container(border=True):
-        st.subheader("3 · Enrich contactable playlists — saves, artist size, real freshness")
+        st.subheader("3 · Enrich — catch-up")
         df = st.session_state.df
-        need_det = df[df.apply(has_contact, axis=1) & (df["Last Added"].isna()) & ~df["Is Editorial"] & ~df["Declined"]] if len(df) else df
-        st.caption(f"{len(need_det)} contactable playlists haven't been enriched. One request each (50 tracks) fills followers, median plays → Reachability, "
-                   "and newest added-date → Freshness. Only the playlists you might actually pitch — never the junk.")
+        need_det = _pending_enrich(df) if len(df) else df
+        st.caption(f"Every search now enriches its new contactable playlists automatically. {len(need_det)} contactable playlists are still un-enriched "
+                   "(from earlier runs, hand-added, or a run that was interrupted) — this fills them in.")
         n_det = st.number_input("Max playlists this pass", 1, 500, min(50, max(1, len(need_det))), key="n_det")
         if st.button(f"Enrich {min(int(n_det), len(need_det))} playlists" + (" (free)" if use_api else ""), disabled=not len(need_det) or (not use_api and not token)):
             if use_api:
@@ -1880,14 +1942,33 @@ def _run_details(token, urls):
     except Exception as e:
         status.error(f"Detail fetch failed: {e}")
 
+def _pending_enrich(df):
+    """Contactable, not yet enriched, not declined/editorial."""
+    if df.empty:
+        return df
+    m = df.apply(has_contact, axis=1) & df["Last Added"].isna() & (df["Saves"] == 0) & ~df["Is Editorial"] & ~df["Declined"]
+    return df[m]
+
 def _run_spotify_api(keywords=None, urls=None):
+    """Search → (auto) enrich the new contactable playlists → save. One click, everything filled."""
     progress, status = st.progress(0.0), st.empty()
     def report(frac, text):
         progress.progress(min(1.0, max(0.0, float(frac)))); status.info(text)
     try:
+        before = set(st.session_state.df["Playlist_ID"].astype(str))
         df2, summary = core_discover_spotify(st.session_state.df, seen_playlists, blocked_owners, PROF, keywords or [], report, urls=urls)
         st.session_state.df = df2; persist(df2)
-        flash("success", summary); st.rerun()
+        enriched = 0
+        if PROF.get("auto_enrich", True):
+            pend = _pending_enrich(df2)
+            pend = pend[~pend["Playlist_ID"].astype(str).isin(before)] if len(pend) else pend  # only this run's new rows
+            if len(pend):
+                def report2(frac, text):
+                    progress.progress(min(1.0, max(0.0, float(frac)))); status.info("Enriching new contactable playlists — " + text)
+                df3, enriched = enrich_with_spotify(st.session_state.df, pend.index.tolist(), report2)
+                st.session_state.df = ensure_schema(df3); persist(st.session_state.df)
+        flash("success", summary + (f" Enriched {enriched} new contactable playlists (saves, artist size, last-added) — ready to review." if enriched else ""))
+        st.rerun()
     except Exception as e:
         status.error(f"Discovery failed: {e}")
 
@@ -2088,6 +2169,9 @@ def page_send():
         st.caption(f"Curator: **{row['Owner Name']}** ({row['Owner URL']})" + (f" · also runs {len(siblings)} other playlist(s) you found — one pitch covers them all." if len(siblings) else ""))
         if row["Cost Tag"] == "paid-link":
             st.warning("This curator links to a paid submission service. Pitch anyway or skip — your call.")
+        if str(row.get("Bot Risk", "")) in ("Medium", "High"):
+            st.warning(f"Bot risk **{row['Bot Risk']}** — {safe_int(row['Saves']):,} saves, median track popularity {safe_int(row['Median Popularity'])}, {safe_int(row['Adds 7d'])} adds in a week. "
+                       "Fake-follower playlists deliver fake streams that can hurt your Spotify profile. Skip unless you know this curator.")
 
         pitch = st.text_area("Pitch (editable — saves on send)", value=row["Draft Pitch"], height=200, key=f"pitch_{idx}")
         if pitch != row["Draft Pitch"]:
@@ -2134,17 +2218,96 @@ def page_send():
 # ============================================================================
 # PAGE: Playlists — the full table. Everything is editable; add, delete, block.
 # ============================================================================
+def _norm_contact_value(col, val):
+    """Normalise what a human typed into a contact cell."""
+    v = "" if val is None or (isinstance(val, float) and pd.isna(val)) else str(val).strip()
+    if col == "Instagram":
+        if not v or v.lower() in ("none", "nan"):
+            return "None"
+        if v.startswith("@") or ("/" not in v and "." not in v):
+            return "https://instagram.com/" + v.lstrip("@")
+        if "instagram.com" in v and not v.lower().startswith("http"):
+            return "https://" + v.lstrip("/")
+        return v
+    if col == "Submission Link":
+        if not v or v.lower() in ("none", "nan"):
+            return ""
+        return v if v.lower().startswith("http") else "https://" + v
+    if col == "Email Address":
+        return v if v and v.lower() not in ("none", "nan") else "None Found"
+    return val
+
+def _pl_autosave():
+    """on_change for the Playlists editor: apply the edited cells to the real rows (mapped by position), handle
+    Remove / Block, tag manual contacts, persist, then bump the editor version so the widget resets cleanly."""
+    key = st.session_state.get("_pl_key"); positions = st.session_state.get("_pl_positions") or []
+    state = st.session_state.get(key) or {}
+    edited = state.get("edited_rows") or {}
+    if not edited:
+        return
+    df = st.session_state.df
+    removed, blocked_now, gained = [], set(), 0
+    for pos, changes in edited.items():
+        try:
+            i = positions[int(pos)]
+        except Exception:
+            continue
+        if i not in df.index:
+            continue
+        had_contact = has_contact(df.loc[i])
+        for col, val in changes.items():
+            if col == "❌ Remove":
+                if val: removed.append(i)
+                continue
+            if col == "🗑️ Block":
+                if val:
+                    oid = str(df.at[i, "Owner_ID"])
+                    if is_valid_data(oid): blocked_now.add(oid)
+                continue
+            if col in ("Email Address", "Instagram", "Submission Link"):
+                val = _norm_contact_value(col, val)
+                df.at[i, col] = val
+                df.at[i, "Contact Source"], df.at[i, "Contact Confidence"] = "manual", 100
+                df.at[i, "Contact Tier"] = contact_tier(df.at[i, "Email Address"], df.at[i, "Instagram"], df.at[i, "Submission Link"], df.at[i, "Playlist Name"], df.at[i, "Description"])
+                if df.at[i, "Cost Tag"] == "unknown" and df.at[i, "Contact Tier"] != "C":
+                    df.at[i, "Cost Tag"] = "free"
+                continue
+            if col in ("Pitched", "Replied", "Added", "Declined", "Followed Up", "🔄 Regenerate", "Invites Subs"):
+                df.at[i, col] = bool(val)
+                if col == "Added" and val: df.at[i, "Added_Date"] = pd.Timestamp.now()
+                if col == "Pitched" and val and pd.isna(df.at[i, "Pitch_Date"]): df.at[i, "Pitch_Date"] = pd.Timestamp.now()
+                continue
+            if col in ("Saves", "Track Count", "Quality Score", "Fit Score"):
+                df.at[i, col] = safe_int(val); continue
+            df.at[i, col] = "" if val is None else val
+        if not had_contact and has_contact(df.loc[i]):
+            gained += 1
+    if blocked_now:
+        blocked_owners.update(blocked_now); save_json_set(blocked_owners, BLOCKED_OWNERS_FILE)
+        removed += df.index[df["Owner_ID"].astype(str).isin(blocked_now)].tolist()
+    if removed:
+        df = df.drop(index=sorted(set(removed))).reset_index(drop=True)
+    st.session_state.df = ensure_schema(df); persist(st.session_state.df)
+    st.session_state["_pl_ver"] = st.session_state.get("_pl_ver", 0) + 1
+    bits = []
+    if gained: bits.append(f"{gained} row(s) gained a contact → now under Tier A/B")
+    if removed: bits.append(f"{len(removed)} removed")
+    if blocked_now: bits.append(f"{len(blocked_now)} curator(s) blocked")
+    st.toast("Saved" + (" · " + " · ".join(bits) if bits else "") + " ✓")
+
 def page_playlists():
     show_flash()
     st.title("📋 Playlists")
     st.caption("Every field is yours to edit. Found a contact by hand? Type it in — it's tagged `manual` and ranks highest. Tick ❌ to delete a playlist, 🗑️ to block the curator (all their playlists, forever).")
     df = st.session_state.df
 
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3, f4, f5 = st.columns(5)
     tier = f1.radio("Contact", ["All", "A · open for subs", "B · has contact", "Needs manual look"], horizontal=False)
     lane = f2.radio("Reachability", ["All", "In your lane", "Stretch", "Skip (superstars)", "Below you", "Unknown"], horizontal=False)
-    cost = f3.radio("Cost", ["All", "free", "paid-link", "unknown"], horizontal=False)
-    stage = f4.radio("Pipeline", ["All", "Not pitched", "Pitched", "Replied", "Added", "Declined"], horizontal=False,
+    fresh = f3.radio("Freshness", ["All", "Fresh (≤30d)", "Active (≤90d)", "Stale (≤1y)", "Dormant (>1y)", "Text signal only", "Unknown"], horizontal=False)
+    bot = f3.radio("Bot risk", ["All", "Low", "Medium", "High", "Unknown"], horizontal=True)
+    cost = f4.radio("Cost", ["All", "free", "paid-link", "unknown"], horizontal=False)
+    stage = f5.radio("Pipeline", ["All", "Not pitched", "Pitched", "Replied", "Added", "Declined"], horizontal=False,
                      help="Declined includes curators whose description says 'no submissions' — auto-marked so they never enter the queue.")
     search = st.text_input("Search name / owner / description")
     h1, h2 = st.columns(2)
@@ -2162,6 +2325,9 @@ def page_playlists():
         v = v[~rowmask(v, has_contact) & ~v["Is Editorial"]].sort_values("Invites Subs", ascending=False)
         st.info(f"{int(v['Invites Subs'].sum())} of these INVITE submissions but hid the contact — start your manual stalking there (listed first).")
     if lane != "All": v = v[v["Reachability"] == lane]
+    if bot != "All": v = v[v["Bot Risk"] == bot]
+    if fresh == "Text signal only": v = v[v["Freshness"].str.startswith(("Claims", "Mentions"), na=False)]
+    elif fresh != "All": v = v[v["Freshness"] == fresh]
     if cost != "All": v = v[v["Cost Tag"] == cost]
     if stage == "Not pitched": v = v[~v["Pitched"]]
     elif stage != "All": v = v[v[stage]]
@@ -2169,17 +2335,32 @@ def page_playlists():
         s = search.lower()
         v = v[v["Playlist Name"].str.lower().str.contains(s, na=False) | v["Owner Name"].str.lower().str.contains(s, na=False) | v["Description"].str.lower().str.contains(s, na=False)]
     if only_bands: v = v[rowmask(v, lambda r: in_bands(r, PROF))]
-    st.caption(f"{len(v)} of {len(df)} playlists · {v.loc[v['Owner_ID'].apply(is_valid_data), 'Owner_ID'].nunique()} curators")
+    st.caption(f"{len(v)} of {len(df)} playlists · {v.loc[v['Owner_ID'].apply(is_valid_data), 'Owner_ID'].nunique()} curators"
+               + ("" if not len(v) else f" · {int(v.apply(lambda r: in_bands(r, PROF), axis=1).sum())} pass your bands + freshness gate"))
+    if fresh == "Dormant (>1y)" and len(v):
+        if st.button(f"🗑 Remove all {len(v)} dormant playlists shown (not pitched/manual)"):
+            keep_mask = df.index.isin(v.index) & ~df["Pitched"] & (df["Contact Source"] != "manual")
+            st.session_state.df = ensure_schema(df.drop(index=df.index[keep_mask]).reset_index(drop=True)); persist(st.session_state.df)
+            flash("success", f"Removed {int(keep_mask.sum())} dormant playlists."); st.rerun()
 
     show_cols = ["🗑️ Block", "❌ Remove", "Pitched", "Replied", "Added", "Playlist Name", "Owner Name", "Saves", "Track Count", "Last Added",
-                 "Contact Tier", "Invites Subs", "Reachability", "Freshness", "Cost Tag", "Email Address", "Instagram", "Submission Link", "Contact Source",
+                 "Contact Tier", "Invites Subs", "Reachability", "Freshness", "Bot Risk", "Adds 7d", "Cost Tag", "Email Address", "Instagram", "Submission Link", "Contact Source",
                  "Quality Score", "Fit Score", "Draft Pitch", "🔄 Regenerate", "Notes", "Playlist URL", "Description"]
-    edited = st.data_editor(
-        v[show_cols], width="stretch", height=560, num_rows="fixed", key="pl_editor",
+    st.caption("Edits save automatically (and sync to GitHub) as you make them — no button. A row that gains a contact moves to Tier A/B, so it leaves the 'Needs manual look' view.")
+    # Widget key changes whenever the visible rows change (filters, or a row moving out of the view) and after every
+    # save, so the editor never carries stale edits onto different rows. The scroll-restore script puts the grid back
+    # where you were after the rerun.
+    view_sig = hashlib.md5(("|".join(map(str, v.index)) + f"|{tier}|{lane}|{cost}|{stage}|{search}|{hide_nc}|{only_bands}").encode()).hexdigest()[:10]
+    editor_key = f"pl_editor_{view_sig}_v{st.session_state.get('_pl_ver', 0)}"
+    st.session_state["_pl_positions"] = list(v.index)
+    st.session_state["_pl_key"] = editor_key
+    st.data_editor(
+        v[show_cols], width="stretch", height=560, num_rows="fixed", key=editor_key, on_change=_pl_autosave,
         column_config={
             "Playlist URL": st.column_config.LinkColumn(display_text="open"),
-            "Instagram": st.column_config.LinkColumn(display_text="ig"),
-            "Submission Link": st.column_config.LinkColumn(display_text="link"),
+            "Instagram": st.column_config.TextColumn(help="Paste a URL or just @handle — saved as an Instagram link"),
+            "Submission Link": st.column_config.TextColumn(help="Any URL; https:// is added if missing"),
+            "Email Address": st.column_config.TextColumn(),
             "Saves": st.column_config.NumberColumn(format="%d"),
             "Contact Tier": st.column_config.SelectboxColumn(options=["A", "B", "C"]),
             "Reachability": st.column_config.SelectboxColumn(options=["In your lane", "Stretch", "Skip (superstars)", "Below you", "Unknown"]),
@@ -2188,35 +2369,6 @@ def page_playlists():
             "Description": st.column_config.TextColumn(width="large"),
         },
     )
-    if st.button("💾 Apply edits, deletes and blocks", type="primary"):
-        blocked_now, removed = set(), 0
-        for i in edited.index:
-            if edited.at[i, "🗑️ Block"]:
-                oid = str(df.at[i, "Owner_ID"])
-                if is_valid_data(oid): blocked_now.add(oid)
-            if edited.at[i, "❌ Remove"]:
-                removed += 1
-            for col in show_cols:
-                if col in UI_ONLY_COLS: continue
-                new, old = edited.at[i, col], df.at[i, col]
-                blank = lambda v: v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() in ("", "nan", "None", "None Found")
-                if blank(new) and blank(old):
-                    continue
-                if str(new) != str(old):
-                    df.at[i, col] = new
-                    if col in ("Email Address", "Instagram", "Submission Link"):
-                        df.at[i, "Contact Source"], df.at[i, "Contact Confidence"] = "manual", 100
-                        df.at[i, "Contact Tier"] = contact_tier(df.at[i, "Email Address"], df.at[i, "Instagram"], df.at[i, "Submission Link"], df.at[i, "Playlist Name"], df.at[i, "Description"])
-                        if df.at[i, "Cost Tag"] == "unknown": df.at[i, "Cost Tag"] = "free"
-                    if col == "Added" and new: df.at[i, "Added_Date"] = pd.Timestamp.now()
-        drop = edited.index[edited["❌ Remove"]].tolist()
-        if blocked_now:
-            blocked_owners.update(blocked_now); save_json_set(blocked_owners, BLOCKED_OWNERS_FILE)
-            drop += df.index[df["Owner_ID"].astype(str).isin(blocked_now)].tolist()
-        df = df.drop(index=sorted(set(drop))).reset_index(drop=True)
-        st.session_state.df = ensure_schema(df); persist(st.session_state.df)
-        flash("success", f"Saved. Removed {removed} playlist(s), blocked {len(blocked_now)} curator(s) — synced to GitHub.")
-        st.rerun()
 
     with st.expander("➕ Add a playlist by hand (no scrape)"):
         with st.form("manual_add"):
@@ -2300,8 +2452,14 @@ def page_settings():
                                (int(PROF["lane_min_plays"]), int(PROF["lane_max_plays"])), step=1000, format="%d",
                                help="How big are the artists already on it? Above your top = Stretch; > 50M = superstars (skipped).")
         PROF["lane_min_plays"], PROF["lane_max_plays"] = lmin, lmax
-        st.caption("Always skipped at ingest: Spotify editorial · type-beat / instrumental · famous-artist / chart / \"Top 100\" · blank (no description, no contact) · "
-                   "\"no submissions\" curators (auto-declined). Nothing to switch on.")
+        g1, g2 = st.columns([2, 1])
+        _gates = {"any": "Any (no freshness gate)", "exclude_dormant": "Exclude dormant (last add > 1 year ago)", "active": "Active only (last add ≤ 90 days)", "fresh": "Fresh only (last add ≤ 30 days)"}
+        PROF["freshness_gate"] = g1.selectbox("Freshness gate for the pitch queue", list(_gates), index=list(_gates).index(PROF.get("freshness_gate", "exclude_dormant")), format_func=_gates.get,
+                                              help="Uses real Last-Added dates once enriched; before that, text signals ('Mentions 2026', 'updated weekly' ≈ active; 'Mentions 2019' ≈ dormant).")
+        PROF["require_known_freshness"] = g2.checkbox("Require a known date", value=bool(PROF.get("require_known_freshness", False)),
+                                                      help="ON = rows with no date and no claim stay out of the queue until you run Enrich.")
+        st.caption("Always skipped at ingest: Spotify editorial · type-beat / instrumental · famous-artist / chart / \"Top 100\" · paid-promo / \"guaranteed streams\" services · "
+                   "blank (no description, no contact) · \"no submissions\" curators (auto-declined). After enrichment, **High bot-risk** playlists (bought followers, churn) are kept out of the queue.")
 
     if st.button("💾 Save settings", type="primary"):
         save_profile(PROF); cloud_sync(); flash("success", "Settings saved and synced."); st.rerun()
@@ -2313,6 +2471,8 @@ def page_settings():
                                                   help="Apify kills the run at this point. Whatever it collected is imported anyway.")
         PROF["runaway_factor"] = c1.number_input("Runaway guard (× playlists asked, 0 = off)", 0.0, 10.0, float(PROF.get("runaway_factor", 2.5)), step=0.5,
                                                  help="If the actor writes more records than asked × this factor, the app aborts the run and imports what it has.")
+        PROF["auto_enrich"] = st.checkbox("Auto-enrich new contactable playlists right after each search", value=bool(PROF.get("auto_enrich", True)),
+                                          help="ON (default): one search click gives you saves, artist size and real last-added dates for every new contactable playlist. Junk and no-contact rows are never enriched.")
         PROF["fetch_tracks"] = st.checkbox("Fetch tracks during the wide SEARCH (slow — off by default)", value=bool(PROF.get("fetch_tracks", False)),
                                            help="Leave off. Search stays fast; Discover → step 3 fetches tracks (one request each) only for contactable playlists, which is where saves, artist size and real freshness matter.")
         PROF["track_limit"] = c2.number_input("Tracks fetched per playlist (50 = one request)", 50, 1000, int(PROF.get("track_limit", 50)), step=50,
@@ -2327,6 +2487,9 @@ def page_settings():
         PROF["skip_instrumental"] = e1.checkbox("Skip type-beat / instrumental", value=bool(PROF.get("skip_instrumental", True)))
         PROF["skip_mainstream"] = e1.checkbox("Skip famous-artist / chart playlists", value=bool(PROF.get("skip_mainstream", True)))
         PROF["skip_blank"] = e2.checkbox("Skip blank playlists (no description, no contact)", value=bool(PROF.get("skip_blank", True)))
+        PROF["skip_promo"] = e1.checkbox("Skip paid-promo / 'guaranteed streams' services at ingest", value=bool(PROF.get("skip_promo", True)))
+        PROF["exclude_bot_high"] = e2.checkbox("Keep High bot-risk playlists out of the pitch queue", value=bool(PROF.get("exclude_bot_high", True)),
+                                               help="High = promo-service language, or ≥5k saves with median track popularity ≤5 (bought followers), or ≥40 tracks added in a week (churn).")
         PROF["keep_no_contact"] = e2.checkbox("Keep no-contact playlists that DO have a description (hidden)", value=bool(PROF.get("keep_no_contact", True)),
                                               help="A sibling 'Submit Your Music' playlist from the same curator can still fill them.")
         PROF["exclude_words"] = st.text_input("Extra playlist-name words to skip (comma-separated)", PROF.get("exclude_words", ""))
