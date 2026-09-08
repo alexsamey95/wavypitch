@@ -40,15 +40,21 @@ Token: GitHub → Settings → Developer settings → **Fine-grained tokens** �
 
 The sidebar shows `☁️ All changes saved to GitHub · HH:MM`, a pending count, or an error. There's also a manual **Save to cloud now** button, and a ZIP backup in Settings as belt-and-braces.
 
-## Apify actor
+## Apify actor — use a DEDICATED playlist scraper
 
-Default: `khadinakbar/spotify-all-in-one-scraper` (style `all-in-one`). The field mapper also understands ScrapeArchitect-style output (`playlist_description`, `owner_url`, …) — pick style `playlist-scraper` in Settings. **After your first run, open Discover → "Raw sample"** and confirm the actor returned `description`, `followers`, `owner`, and a tracklist with `playcount` — those power the contact sweep and the Reachability score. If a field is missing, the mapper degrades gracefully (you'll just see `Unknown` reachability or fewer auto-found contacts) rather than crashing.
+Settings → Apify actor → paste the slug of a **Spotify playlist** actor (e.g. `scrapearchitect/spotify-playlist-scraper` — copy the exact slug from its Apify store URL, `apify.com/OWNER/ACTOR`). Style `playlist-scraper`.
+
+**Why not the all-in-one actor:** its keyword search returns ~6 entity types (artists, albums, tracks, playlists, shows, episodes) per keyword and bills every one — we only keep playlists, so ~5/6 of the spend is thrown away. A dedicated playlist actor returns only playlists. Style `all-in-one` is still supported for URL-mode detail fetches but is warned against for search.
+
+**Fast mode by default:** search runs with `fetchDetails=false`, returning `playlist_description` + `playlist_owner` + `owner_url` — the contact fields — at the cheapest tier. Saves + tracklists are fetched later (Discover → step 3) **only for contactable playlists**, so credits never go to dead leads.
+
+**Hard cap:** every run is started with `max_total_charge_usd` (default $1.00, Settings) — Apify aborts the run at the cap. Residential proxy bandwidth (required for Spotify) is billed by Apify on top of per-result pricing, so the cap is your real safety net. **After your first run, open Discover → "Raw sample"** and confirm the actor returned `description`, `followers`, `owner`, and a tracklist with `playcount` — those power the contact sweep and the Reachability score. If a field is missing, the mapper degrades gracefully (you'll just see `Unknown` reachability or fewer auto-found contacts) rather than crashing.
 
 ## Cost (realistic)
 
 | API | Job | ≈ per month |
 |---|---|---|
-| Apify Spotify actor | discovery | $2–6 for ~400 playlists |
+| Apify Spotify playlist actor | discovery (fast mode) | varies by actor + proxy usage — set the hard cap |
 | Apify Instagram scraper | bio → email, gated | $0.50–1.50 |
 | Gemini Flash | name cleanup | pennies |
 | Claude.ai (free batch loop) | writing pitches | $0 |

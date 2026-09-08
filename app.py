@@ -18,6 +18,7 @@ import base64
 import hashlib
 import zipfile
 import unicodedata
+import html as html_lib
 import urllib.request
 import urllib.error
 from statistics import median
@@ -85,9 +86,15 @@ DEFAULT_PROFILE = {
     "lane_max_plays": 5000000,
     "dump_bin_tracks": 500,
     "daily_cap": 15,
-    "actor_id": DEFAULT_ACTOR,
-    "actor_style": "all-in-one",   # or "playlist-scraper" (ScrapeArchitect-style)
-    "results_per_keyword": 40,
+    "actor_id": "",                 # paste the exact slug from the Apify store page
+    "actor_style": "playlist-scraper",  # dedicated playlist actor: returns ONLY playlists (no wasted entity types)
+    "results_per_keyword": 20,
+    "fetch_details": False,          # fast mode = description/owner (contacts) cheaply; details (saves/tracks) on demand
+    "skip_instrumental": True,       # drop type-beat / instrumental playlists at ingest (they won't add vocals)
+    "skip_mainstream": True,         # drop "famous songs / Top 100 / chart hits / Drake, Eminem, Kanye…" playlists at ingest
+    "exclude_words": "type beat, instrumental, beat tape, producer pack",  # extra NAME words to skip
+    "keep_no_contact": True,         # store Tier-C rows (hidden by default) so sibling contacts can still fill them
+    "max_usd_per_run": 1.0,          # hard cap — Apify aborts the run at this spend
 }
 
 def load_profile():
@@ -112,12 +119,12 @@ COLUMN_ORDER = [
     "Pitched", "Followed Up", "Replied", "Added", "Declined",
     "Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB",
     "Playlist_ID", "Playlist Name", "Playlist URL", "Owner Name", "Owner_ID", "Owner URL",
-    "Saves", "Track Count", "Median Playcount", "Description", "Keyword",
+    "Saves", "Track Count", "Median Playcount", "Last Added", "Description", "Keyword",
     "Contact Tier", "Reachability", "Cost Tag", "Fit Score", "Quality Score",
     "Email Address", "Instagram", "Submission Link", "Contact Source", "Contact Confidence",
     "IG Bio", "IG Followers",
     "Channel", "Draft Pitch", "🔄 Regenerate", "Notes",
-    "Is Editorial", "Is Dump Bin",
+    "Is Editorial", "Is Dump Bin", "Invites Subs",
 ]
 
 TEXT_DEFAULTS = {
@@ -129,10 +136,10 @@ TEXT_DEFAULTS = {
     "Channel": "", "Draft Pitch": "", "Notes": "",
 }
 BOOL_COLS = ["🗑️ Block", "❌ Remove", "Pitched", "Followed Up", "Replied", "Added", "Declined",
-             "🔄 Regenerate", "Is Editorial", "Is Dump Bin"]
+             "🔄 Regenerate", "Is Editorial", "Is Dump Bin", "Invites Subs"]
 INT_COLS = ["Saves", "Track Count", "Median Playcount", "Fit Score", "Quality Score",
             "Contact Confidence", "IG Followers"]
-DATE_COLS = ["Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB"]
+DATE_COLS = ["Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB", "Last Added"]
 UI_ONLY_COLS = ["🗑️ Block", "❌ Remove"]
 
 def ensure_schema(df):
@@ -428,10 +435,15 @@ def safe_int(val, default=0):
         return default
 
 def normalize_text(text):
-    """Flatten stylized unicode (𝐛𝐨𝐥𝐝, 𝕗𝕒𝕟𝕔𝕪) to plain ASCII-ish and strip emoji."""
+    """Unescape HTML (&amp; &#x2F; …), lift URLs out of <a href> tags, strip tags,
+    flatten stylized unicode (𝐛𝐨𝐥𝐝, 𝕗𝕒𝕟𝕔𝕪) and strip emoji. Spotify descriptions
+    arrive HTML-escaped, so this must run before any regex."""
     if not text:
         return ""
-    t = unicodedata.normalize("NFKC", str(text))
+    t = html_lib.unescape(html_lib.unescape(str(text)))  # double-escaped entities are common
+    t = re.sub(r'<a\s[^>]*href=["\']([^"\']+)["\'][^>]*>', r' \1 ', t, flags=re.IGNORECASE)
+    t = re.sub(r'<[^>]+>', ' ', t)
+    t = unicodedata.normalize("NFKC", t)
     t = "".join(ch for ch in t if not (0x1F000 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF
                                       or 0xFE00 <= ord(ch) <= 0xFE0F or ord(ch) == 0x200D))
     return re.sub(r"\s+", " ", t).strip()
@@ -467,10 +479,13 @@ def extract_instagram(text):
     for h in re.findall(r'\b(?:ig|insta|instagram)\b\s*[:\-–]?\s*@?([a-zA-Z0-9_.]{2,30})', text, re.IGNORECASE):
         if h.lower() not in ("https", "http", "com"):
             links.append(f"https://instagram.com/{h}")
-    if not links and re.search(r'\b(ig|insta|instagram|dm)\b', text, re.IGNORECASE):
-        for h in re.findall(r'(?<![\w.])@([a-zA-Z0-9_.]{2,30})', text):
-            if "." not in h[-1:]:
+    if not links:
+        # A lone @handle in a Spotify description is nearly always a social handle.
+        for h in re.findall(r'(?<![\w.])@([a-zA-Z0-9_.]{3,30})(?![\w.]*\.[a-z]{2,}\b(?![./]))', text):
+            h = h.rstrip(".")
+            if h.lower() not in ("gmail", "hotmail", "outlook", "yahoo") and not re.search(r'\.(com|net|org|io)$', h, re.I):
                 links.append(f"https://instagram.com/{h}")
+                break
     return links[0] if links else "None"
 
 def extract_ig_username(ig_url):
@@ -479,21 +494,60 @@ def extract_ig_username(ig_url):
         return m.group(1).split("?")[0].strip("/")
     return str(ig_url).replace("@", "").strip()
 
-SUBMISSION_LINK_RE = re.compile(
-    r'(https?://[^\s<>"]*(?:submithub|groover|musosoup|playlistpush|soundcampaign|linktr\.ee|forms\.gle|docs\.google\.com/forms|typeform|beacons\.ai|bio\.link)[^\s<>"]*)',
-    re.IGNORECASE,
-)
-PAID_RE = re.compile(r'(submithub|groover|musosoup|playlist\s*push|soundcampaign|\$\s?\d|\d\s?(usd|eur|€|£)|paid\s*(promo|placement|submission)|\bfee\b|pay\s*to\s*(play|submit))', re.IGNORECASE)
-INTENT_RE = re.compile(r'\b(submit|submission|submissions|pitch|for\s+consideration|send\s+(us|me)\s+your|dm\s+(me|us)?\s*(for|to)|email\s+(me|us)?\s*(for|to|at)|add\s+your|want\s+to\s+be\s+(added|featured)|open\s+for|accepting)\b', re.IGNORECASE)
+SUBMISSION_PLATFORMS = r'(?:sbmt\.to|submithub|groover|musosoup|playlistpush|upnextapp|dailyplaylists|soundcampaign|indiemono|submit\.link|linktr\.ee|forms\.gle|docs\.google\.com/forms|typeform|beacons\.ai|bio\.link)'
+SUBMISSION_LINK_RE = re.compile(r'((?:https?://)?(?:www\.)?[^\s<>"\']*' + SUBMISSION_PLATFORMS + r'[^\s<>"\']*)', re.IGNORECASE)
+BARE_DOMAIN_RE = re.compile(r'^(?:https?://)?(?:www\.)?([a-z0-9-]+\.(?:com|net|io|co|app|fm|to|link|me|org|music))(?:/\S*)?$', re.IGNORECASE)
+PAID_RE = re.compile(r'(sbmt\.to|submithub|groover|musosoup|playlist\s*push|upnextapp|dailyplaylists|soundcampaign|\$\s?\d|\d\s?(usd|eur|€|£)|paid\s*(promo|placement|submission)|\bfee\b|pay\s*to\s*(play|submit))', re.IGNORECASE)
+INTENT_RE = re.compile(
+    r'\b(submit|submission|submissions|pitch|for\s+consideration|send\s+(us|me)\s+your|dm\s+(me|us)?\s*(for|to)|email\s+(me|us)?\s*(for|to|at)|add\s+your|want\s+to\s+be\s+(added|featured)|open\s+for|accepting'
+    r'|tienes\s+temas|env[ií]a|manda|m[aá]ndanos|contacto|cont[aá]ctame|por\s+aqu[ií]'          # es
+    r'|envie|mande|submeta|contato'                                                             # pt
+    r'|envoyez|soumettre|proposer|contactez'                                                     # fr
+    r'|einreichen|schick|kontakt'                                                                # de
+    r'|invia|inviate|proponi|contatta)\b', re.IGNORECASE)
 SUBMIT_PLAYLIST_NAME_RE = re.compile(r'\b(?:submit|submission|submissions|contact|read\s+description|how\s+to\s+(?:submit|get\s+added)|send\s+your)\b', re.IGNORECASE)
+
+NO_SUBS_RE = re.compile(
+    r"\b(no\s+(?:more\s+)?(?:submissions?|subs|pitches|requests|promo|promotion|dms?)|not\s+(?:accepting|taking|open\s+(?:to|for))\s+(?:any\s+)?(?:submissions?|subs|pitches|requests)"
+    r"|do\s*n[o']t\s+(?:send|submit|pitch|dm)|closed\s+(?:to|for)\s+submissions?|submissions?\s+(?:are\s+)?closed|don'?t\s+ask\s+(?:me\s+)?to\s+add"
+    r"|no\s+se\s+aceptan|non\s+accetto|keine\s+(?:einreichungen|anfragen)|pas\s+de\s+soumissions?)\b", re.IGNORECASE)
+
+def refuses_submissions(*texts):
+    return any(NO_SUBS_RE.search(normalize_text(t) or "") for t in texts if t)
+
+# A curator's own website in the description is a door too (it'll have a contact page).
+# Skip platforms that aren't contacts: Spotify itself, YouTube, Apple, image/CDN links.
+NON_CONTACT_DOMAINS = re.compile(r"(spotify\.com|spoti\.fi|youtube\.com|youtu\.be|music\.apple\.com|apple\.com|scdn\.co|i\.scdn|freepik|unsplash|pexels|giphy|imgur|wikipedia\.org|google\.com/search"
+                                 r"|lnk\.to|linkfire|ffm\.to|fanlink|song\.link|hypeddit|distrokid|ditto|deezer|tidal|amazon\.|soundcloud\.com/[^/]+/sets)", re.I)
+WEBSITE_RE = re.compile(r"((?:https?://|www\.)[^\s<>\"'()\[\]]+|\b(?!e\.g\b)[a-z0-9-]{2,}(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|co|me|fm|link|app|music|xyz|site|page|store|shop|band|rocks)\b(?:/[^\s<>\"'()\[\]]*)?)", re.I)
+
+def extract_website(text):
+    """First non-platform website URL in the text, or ''. Runs after the submission-platform check."""
+    if not text:
+        return ""
+    t = re.sub(r'[a-zA-Z0-9%._+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', ' ', normalize_text(text))  # never mistake an email's domain for a website
+    for m in WEBSITE_RE.finditer(t):
+        u = m.group(1).rstrip(".,;:!?)|]'\"")
+        if NON_CONTACT_DOMAINS.search(u) or "@" in u or re.search(r"\.(png|jpe?g|gif|webp|svg|mp3|mp4|wav)$", u, re.I):
+            continue
+        if len(u.split(".")[0].replace("https://", "").replace("http://", "").replace("www.", "")) < 2:
+            continue
+        return u if u.lower().startswith("http") else "https://" + u
+    return ""
 
 def extract_submission_link(text):
     if not text:
         return ""
     m = SUBMISSION_LINK_RE.search(normalize_text(text))
-    return m.group(1).split()[0].rstrip('.,)') if m else ""
+    if not m:
+        return ""
+    u = m.group(1).split()[0].rstrip('.,)|]')
+    return u if u.lower().startswith("http") else "https://" + u
 
 def has_submission_intent(*texts):
+    """True if the text invites pitches — and is NOT a negation like 'NO SUBMISSIONS'."""
+    if refuses_submissions(*texts):
+        return False
     return any(INTENT_RE.search(normalize_text(t) or "") for t in texts if t)
 
 def cost_tag_for(*texts):
@@ -521,14 +575,64 @@ def sweep_contacts(owner_name, playlist_name, description):
                     source, conf = src, weight - 10
         if not link:
             link = extract_submission_link(txt)
-    # The owner display name itself may literally be an @handle
-    if not ig and owner_name:
+            if link:
+                source, conf = source or src, max(conf, 45)
+            elif src != "owner-name":
+                link = extract_website(txt)
+                if link:
+                    source, conf = source or src, max(conf, 40)
+    # The owner display name itself may literally be an @handle or a website
+    if owner_name:
         on = normalize_text(owner_name)
-        if re.fullmatch(r'@?[a-zA-Z0-9_.]{3,30}', on) and on.startswith("@"):
+        if not ig and re.fullmatch(r'@?[a-zA-Z0-9_.]{3,30}', on) and on.startswith("@"):
             ig, source, conf = f"https://instagram.com/{on[1:]}", "owner-name", max(conf, 80)
+        dm = BARE_DOMAIN_RE.match(on)
+        if not link and dm and not email:
+            link = "https://" + dm.group(1).lower()
+            source, conf = source or "owner-name", max(conf, 55)
     if has_submission_intent(playlist_name, description) and (email or ig or link):
         conf = min(100, conf + 10)
     return {"email": email, "instagram": ig, "link": link, "source": source, "confidence": conf}
+
+# Instrumental / type-beat detection — a playlist that won't add a vocal track.
+# The NAME is decisive ("Boom Bap Beats", "Hip Hop Instrumentals", "J Cole Type Beats").
+# The DESCRIPTION only counts if it says instrumental AND never mentions rap/vocals/bars,
+# because mixed playlists ("instrumental and vocal selections") do add vocals.
+INSTR_NAME_RE = re.compile(r"\b(type\s*beats?|instrumentals?|beats?|no\s+(?:lyrics|vocals)|beat\s*tape|study\s+beats?)\b", re.I)
+INSTR_DESC_RE = re.compile(r"\b(type\s*beats?|instrumentals?|no\s+(?:lyrics|vocals)|instrumentals?\s+only|producers?\s+includes?|beat\s*tape)\b", re.I)
+VOCAL_RE = re.compile(r"\b(vocals?|rap|rappers?|bars|flows?|singing|singers?|lyricis[mt]|lyrics|mcs?|verses?|songs?)\b", re.I)
+
+def looks_instrumental(name, description, extra_words=""):
+    name_n, desc_n = normalize_text(name), normalize_text(description)
+    extras = [w.strip() for w in re.split(r"[,\n]", extra_words or "") if w.strip()]
+    if extras and re.search(r"\b(" + "|".join(re.escape(w) for w in extras) + r")\b", name_n, re.I):
+        return True
+    name_v = re.sub(r"\bnothing\s+beats\b", "", name_n, flags=re.I)  # "Nothing beats jazz rap" — verb, not instrumentals
+    mixed = re.search(r"\b(?:beats?\s*(?:and|&|\+|,|/)\s*(?:rap|vocals|bars|rhymes|flows|songs)|(?:rap|vocals|bars|rhymes|flows|songs)\s*(?:and|&|\+|,|/)\s*beats?)\b", name_v, re.I)
+    if INSTR_NAME_RE.search(name_v) and not mixed:
+        return True
+    if INSTR_DESC_RE.search(desc_n) and not VOCAL_RE.search(name_n + " " + desc_n.replace("no lyrics", "").replace("no vocals", "")):
+        return True
+    return False
+
+# Mainstream / superstar playlists — "famous songs", "Top 100", "chart hits", or a roll-call of
+# mega-stars. They don't add unknowns. Readable for free from the text, before any tracklist fetch.
+# Deliberately NOT included: genre-taste names (Nujabes, Dilla, Little Simz, Noname, Loyle Carner…)
+# and vague words (classics, legends, essentials) — jazz-rap curators use those constantly.
+MAINSTREAM_HARD_RE = re.compile(
+    r"\b(famous|popular\s+(?:songs?|rap|hip\s*hop|music|tracks?|artists?)|most\s+popular|chart(?:s|ing|\s*toppers?)?|billboard|top\s*\d{2,3}|hits?|greatest(?:\s+hits)?|best\s+of|viral|trending|tiktok\s+(?:songs?|rap|hits?)|hall\s+of\s+fame)\b", re.I)
+MEGASTAR_RE = re.compile(
+    r"\b(drake|eminem|kanye(?:\s+west)?|kendrick(?:\s+lamar)?|j\.?\s*cole|travis\s+scott|tyler[,]?\s+the\s+creator|childish\s+gambino|post\s+malone|lil\s+(?:baby|wayne|uzi|durk|yachty|tjay|nas\s+x)|future|jay[\s-]?z|tupac|2pac|biggie|snoop(?:\s+dogg)?|dr\.?\s*dre|50\s*cent|kid\s+cudi|mac\s+miller|logic|a\$ap\s+rocky|asap\s+rocky|frank\s+ocean|brent\s+faiyaz|sza|the\s+weeknd|don\s+toliver|21\s+savage|metro\s+boomin|gunna|young\s+thug|playboi\s+carti|juice\s+wrld|xxxtentacion|nba\s+youngboy|rod\s+wave|polo\s+g|jack\s+harlow|megan\s+thee\s+stallion|cardi\s+b|nicki\s+minaj|doja\s+cat|ice\s+spice|central\s+cee|stormzy|dave|big\s+sean|chance\s+the\s+rapper|nelly|ludacris|t\.?i\.?|rick\s+ross|nas|jid|quavo|migos|offset|lil\s+durk|yeat|ken\s+carson|destroy\s+lonely|drake)\b", re.I)
+INDIE_SIGNAL_RE = re.compile(
+    r"\b(undiscovered|unknown|underground|up[\s-]and[\s-]coming|upcoming|emerging|indie|independent|new\s+artists?|unsigned|rising|hidden\s+gems?|talents?\s+on\s+the\s+rise|small\s+artists?|submit|submissions?|discover(?:y|ies)?)\b", re.I)
+
+def looks_mainstream(name, description):
+    t = normalize_text(f"{name} {description}")
+    if MAINSTREAM_HARD_RE.search(t):
+        return True
+    stars = {m.group(0).lower() for m in MEGASTAR_RE.finditer(t)}
+    need = 3 if INDIE_SIGNAL_RE.search(t) else 2
+    return len(stars) >= need
 
 def contact_tier(email, ig, link, playlist_name, description):
     has = is_valid_data(email) or is_valid_data(ig) or bool(link)
@@ -643,8 +747,15 @@ def clean_with_gemini(client, model, owner_name, playlist_name):
 # ----------------------------------------------------------------------------
 # Apify helper (ported)
 # ----------------------------------------------------------------------------
-def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label):
-    run_obj = client.actor(actor_id).start(run_input=run_input)
+def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label, max_usd=None, max_items=None):
+    """Start an actor with a HARD per-run spend cap (Apify aborts the run at the cap) and poll to completion."""
+    from decimal import Decimal
+    kwargs = {"run_input": run_input}
+    if max_usd:
+        kwargs["max_total_charge_usd"] = Decimal(str(round(float(max_usd), 2)))
+    if max_items:
+        kwargs["max_items"] = int(max_items)
+    run_obj = client.actor(actor_id).start(**kwargs)
     run_id = run_obj.get("id") if isinstance(run_obj, dict) else getattr(run_obj, "id", None)
     dataset_id = run_obj.get("defaultDatasetId") if isinstance(run_obj, dict) else getattr(run_obj, "default_dataset_id", getattr(run_obj, "defaultDatasetId", ""))
     if not run_id or not dataset_id:
@@ -707,9 +818,9 @@ def show_flash():
 #   all-in-one       → khadinakbar/spotify-all-in-one-scraper (camelCase, `owner` object)
 #   playlist-scraper → ScrapeArchitect-style (snake_case: playlist_description, owner_url…)
 # ----------------------------------------------------------------------------
-def build_search_input(style, keywords, per_kw):
+def build_search_input(style, keywords, per_kw, fetch_details=False):
     if style == "playlist-scraper":
-        return {"searchMode": "keyword", "keywords": keywords, "maxResults": per_kw, "fetchDetails": True, "trackLimit": 40}
+        return {"searchMode": "keyword", "keywords": keywords, "maxResults": per_kw, "fetchDetails": bool(fetch_details), "trackLimit": 40 if fetch_details else 0}
     return {"searchQueries": keywords, "searchResultsPerType": per_kw,
             "maxResults": per_kw * len(keywords), "responseFormat": "concise"}
 
@@ -754,11 +865,15 @@ def _tracks_summary(item):
         tracks = tracks.get("items")
     if not tracks and isinstance(item.get("content"), dict):
         tracks = item["content"].get("items")
-    plays, artists = [], []
+    plays, artists, added = [], [], []
     for t in (tracks or [])[:60]:
         if not isinstance(t, dict):
             continue
         d = t.get("itemV2", {}).get("data", t) if isinstance(t.get("itemV2"), dict) else t
+        aa = t.get("addedAt") if isinstance(t, dict) else None
+        aa = aa.get("isoString") if isinstance(aa, dict) else (aa or t.get("added_at") if isinstance(t, dict) else None)
+        if aa:
+            added.append(str(aa))
         pc = _first(d, "playcount", "playCount", "play_count", default=None)
         try:
             if pc is not None and str(pc).strip():
@@ -779,7 +894,8 @@ def _tracks_summary(item):
         elif isinstance(a, str):
             artists.append(a)
     med = int(median(plays)) if plays else 0
-    return med, " ".join(dict.fromkeys(artists))
+    last = pd.to_datetime(max(added), errors="coerce", utc=True).tz_localize(None) if added else pd.NaT
+    return med, " ".join(dict.fromkeys(artists)), last
 
 def normalize_playlist_item(item, keyword, prof):
     """Map one raw actor item → one schema row. Returns None if it's not a playlist."""
@@ -804,7 +920,7 @@ def normalize_playlist_item(item, keyword, prof):
     tracks_n = safe_int(_first(item, "totalTracks", "total_tracks", "trackCount", "totalCount", default=0))
     if not tracks_n and isinstance(item.get("content"), dict):
         tracks_n = safe_int(item["content"].get("totalCount", 0))
-    med_plays, artists_text = _tracks_summary(item)
+    med_plays, artists_text, last_added = _tracks_summary(item)
 
     c = sweep_contacts(owner_name_n, name, desc)
     tier = contact_tier(c["email"], c["instagram"], c["link"], name, desc)
@@ -812,7 +928,7 @@ def normalize_playlist_item(item, keyword, prof):
     return {
         "Playlist_ID": str(pid), "Playlist Name": name, "Playlist URL": url,
         "Owner Name": owner_name_n, "Owner_ID": owner_id, "Owner URL": owner_url,
-        "Saves": saves, "Track Count": tracks_n, "Median Playcount": med_plays,
+        "Saves": saves, "Track Count": tracks_n, "Median Playcount": med_plays, "Last Added": last_added,
         "Description": normalize_text(desc)[:1500], "Keyword": keyword,
         "Contact Tier": tier, "Reachability": reachability_bucket(med_plays, prof), "Cost Tag": ctag,
         "Fit Score": fit_score(prof.get("keywords", ""), name, desc, artists_text),
@@ -821,6 +937,9 @@ def normalize_playlist_item(item, keyword, prof):
         "Submission Link": c["link"], "Contact Source": c["source"], "Contact Confidence": c["confidence"],
         "Is Editorial": owner_id.lower() == "spotify" or owner_name_n.lower() == "spotify",
         "Is Dump Bin": tracks_n > int(prof.get("dump_bin_tracks", 500)),
+        "Invites Subs": bool(has_submission_intent(name, desc)),
+        "Declined": bool(refuses_submissions(name, desc)),
+        "Notes": "Curator says: no submissions — auto-declined." if refuses_submissions(name, desc) else "",
         "Added_To_DB": pd.Timestamp.now(),
     }
 
@@ -866,22 +985,25 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     owner-pivot. Mutates + returns df and a summary string. Raises on Apify failure."""
     from apify_client import ApifyClient
     client = ApifyClient(token)
-    style = prof.get("actor_style", "all-in-one")
-    actor = prof.get("actor_id", DEFAULT_ACTOR).strip() or DEFAULT_ACTOR
-    per_kw = int(prof.get("results_per_keyword", 40))
+    style = prof.get("actor_style", "playlist-scraper")
+    actor = (prof.get("actor_id") or "").strip()
+    if not actor:
+        raise RuntimeError("No Apify actor set — paste the actor slug (e.g. owner/spotify-playlist-scraper) in Settings → Apify actor.")
+    per_kw = int(prof.get("results_per_keyword", 20))
     if urls:
         run_input, total, label = build_url_input(style, urls), len(urls), "Scraping playlist URLs"
     else:
-        run_input, total, label = build_search_input(style, keywords, per_kw), per_kw * len(keywords), "Searching Spotify"
-    report(0.0, f"Starting Apify actor {actor}…")
-    status, dataset_id = run_apify_and_poll(client, actor, run_input, total, report, label)
+        run_input, total, label = build_search_input(style, keywords, per_kw, prof.get("fetch_details", False)), per_kw * len(keywords), "Searching Spotify"
+    cap = float(prof.get("max_usd_per_run", 1.0) or 0)
+    report(0.0, f"Starting {actor} (hard cap ${cap:.2f} this run)…")
+    status, dataset_id = run_apify_and_poll(client, actor, run_input, total, report, label, max_usd=cap or None, max_items=total)
     if status != "SUCCEEDED":
         raise RuntimeError(f"Apify run ended with status: {status}")
     report(0.97, "Filtering, sweeping contacts, scoring…")
 
     raw_sample, rows = None, []
     existing = set(df["Playlist_ID"].astype(str))
-    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0}
+    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "nocontact": 0}
     kw_label = ", ".join(keywords) if keywords else "url"
     for item in client.dataset(dataset_id).iterate_items():
         if raw_sample is None:
@@ -892,6 +1014,10 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
         stats["seen"] += 1
         if row["Is Editorial"]:
             stats["editorial"] += 1; continue
+        if not urls and prof.get("skip_instrumental", True) and looks_instrumental(row["Playlist Name"], row["Description"], prof.get("exclude_words", "")):
+            stats["instrumental"] += 1; seen.add(row["Playlist_ID"]); continue
+        if not urls and prof.get("skip_mainstream", True) and looks_mainstream(row["Playlist Name"], row["Description"]):
+            stats["mainstream"] += 1; seen.add(row["Playlist_ID"]); continue
         if row["Owner_ID"] in blocked:
             stats["blocked"] += 1; continue
         if row["Playlist_ID"] in existing or row["Playlist_ID"] in seen:
@@ -900,15 +1026,22 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
         rows.append(row); stats["kept"] += 1
 
     if rows:
+        new_ids = {r["Playlist_ID"] for r in rows}
         df = ensure_schema(pd.concat([df, pd.DataFrame(rows)], ignore_index=True))
         df, sib = propagate_sibling_contacts(df)
+        if not urls and not prof.get("keep_no_contact", True):
+            drop = df.index[df["Playlist_ID"].isin(new_ids) & (df["Contact Tier"] == "C")]
+            stats["nocontact"] = int(len(drop)); df = df.drop(index=drop).reset_index(drop=True); stats["kept"] -= stats["nocontact"]
+        else:
+            stats["nocontact"] = int((df["Playlist_ID"].isin(new_ids) & (df["Contact Tier"] == "C")).sum())
     else:
         sib = 0
     save_json_set(seen, SEEN_PLAYLISTS_FILE)
     st.session_state["_raw_sample"] = raw_sample
     contactable = sum(1 for r in rows if r["Contact Tier"] in ("A", "B"))
-    summary = (f"Kept {stats['kept']} new playlists ({contactable} with a contact, +{sib} via sibling submit-playlists). "
-               f"Skipped {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
+    nc = f"{stats['nocontact']} discarded (no contact)" if not prof.get("keep_no_contact", True) else f"{stats['nocontact']} with no contact yet (hidden by default in Playlists)"
+    summary = (f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
+               f"Skipped {stats['instrumental']} instrumental/type-beat, {stats['mainstream']} mainstream/superstar, {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
     return df, summary
 
 def core_scrape_instagram(df, igs_set, token, report):
@@ -1129,9 +1262,9 @@ def page_dashboard():
     fu = follow_ups_due(df)
     if len(fu):
         todo.append(f"🔁 {len(fu)} pitches are {FOLLOW_UP_DAYS}+ days old with no reply — follow-ups due in **Send**.")
-    manual = int((~df.apply(has_contact, axis=1) & ~df["Is Editorial"] & (df["IG Bio"] != "Not Scanned")).sum()) if len(df) else 0
-    if manual:
-        todo.append(f"🕵️ {manual} playlists came up empty on every automated step — they're in the **Needs manual look** bucket in Playlists.")
+    invited = int((df["Invites Subs"] & ~df.apply(has_contact, axis=1) & ~df["Is Editorial"]).sum()) if len(df) else 0
+    if invited:
+        todo.append(f"🕵️ {invited} playlists **invite submissions** but hid the contact — prime manual-stalking targets, listed first under **Playlists → Needs manual look**.")
     for t in todo or ["✅ Nothing pending. Discover more keywords or check follow-ups."]:
         st.markdown(f"- {t}")
 
@@ -1153,11 +1286,18 @@ def page_discover():
                    "`trap submit`, `drill playlist submissions`, `melodic rap curator` — they bias the search toward playlists that *want* pitches.")
         kws_text = st.text_area("Keywords", value=PROF.get("keywords", ""), height=120, placeholder="trap submit\nmelodic rap submissions\nunderground hip hop curator")
         c1, c2 = st.columns([1, 3])
-        per_kw = c1.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 40)), step=5,
+        per_kw = c1.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5,
                                  help="Start small, look at the contactable-rate the summary reports, then scale.")
         keywords = [k.strip() for k in kws_text.splitlines() if k.strip()]
         est = per_kw * len(keywords)
-        c2.caption(f"≈ {est} results this run · at ~$0.005/result that's ≈ ${est * 0.005:.2f}. Already-seen playlists are skipped and never re-scraped.")
+        cap = float(PROF.get("max_usd_per_run", 1.0))
+        c2.caption(f"≈ {est} playlists this run · **hard cap ${cap:.2f}** (Apify stops the run at the cap — change in Settings). "
+                   f"Fast mode returns description + owner (the contact fields) at the cheapest tier; saves/tracklists are fetched later, only for contactable playlists.")
+        if PROF.get("actor_style") == "all-in-one":
+            st.warning("The all-in-one actor bills ~6 entity types per keyword (artists, tracks, albums, shows…) and we only keep playlists. "
+                       "A dedicated playlist scraper is far cheaper for this job — switch it in Settings.")
+        if not (PROF.get("actor_id") or "").strip():
+            st.error("No actor set — paste the actor slug in Settings → Apify actor (copy it from the Apify store page URL: apify.com/OWNER/ACTOR).")
         if st.button(f"Search Spotify ({len(keywords)} keywords)", type="primary", disabled=not (token and keywords)):
             PROF["keywords"], PROF["results_per_keyword"] = kws_text, int(per_kw)
             save_profile(PROF)
@@ -1173,7 +1313,18 @@ def page_discover():
             _run_discover(token, urls=urls)
 
     with st.container(border=True):
-        st.subheader("3 · Enrich: Instagram bio → email")
+        st.subheader("3 · Fetch details (saves + tracklist) — only for contactable playlists")
+        df = st.session_state.df
+        need_det = df[df.apply(has_contact, axis=1) & (df["Saves"] == 0) & ~df["Is Editorial"]] if len(df) else df
+        st.caption(f"{len(need_det)} contactable playlists have no saves/tracklist yet (fast mode skips them to save credits). "
+                   "This pulls full details for ONLY those, so Quality and Reachability can be scored where it matters.")
+        n_det = st.number_input("Max playlists this pass", 1, 200, min(25, max(1, len(need_det))), key="n_det")
+        if st.button(f"Fetch details for {min(int(n_det), len(need_det))} playlists", disabled=not (token and len(need_det))):
+            urls = need_det["Playlist URL"].head(int(n_det)).tolist()
+            _run_details(token, urls)
+
+    with st.container(border=True):
+        st.subheader("4 · Enrich: Instagram bio → email")
         df = st.session_state.df
         pending = int((df["Instagram"].apply(is_valid_data) & ~df["Email Address"].apply(is_valid_data) & (df["IG Bio"] == "Not Scanned")).sum()) if len(df) else 0
         st.caption(f"{pending} playlists have an @handle but no email. Only these get scraped — nothing else costs a credit.")
@@ -1193,6 +1344,37 @@ def page_discover():
     if st.session_state.get("_raw_sample") is not None:
         with st.expander("🔬 Raw sample from the last actor run (for checking field names)"):
             st.json(st.session_state["_raw_sample"])
+
+def _run_details(token, urls):
+    """URL-mode detail fetch for already-known playlists: update saves / track count / median plays / reachability in place."""
+    progress, status = st.progress(0.0), st.empty()
+    def report(frac, text):
+        progress.progress(min(1.0, max(0.0, float(frac)))); status.info(text)
+    try:
+        from apify_client import ApifyClient
+        client = ApifyClient(token)
+        style = PROF.get("actor_style", "playlist-scraper"); actor = (PROF.get("actor_id") or "").strip()
+        if not actor:
+            raise RuntimeError("No Apify actor set in Settings.")
+        cap = float(PROF.get("max_usd_per_run", 1.0) or 0)
+        status_, ds = run_apify_and_poll(client, actor, build_url_input(style, urls), len(urls), report, "Fetching playlist details", max_usd=cap or None, max_items=len(urls))
+        if status_ != "SUCCEEDED":
+            raise RuntimeError(f"Apify run ended with status: {status_}")
+        df, updated = st.session_state.df, 0
+        for item in client.dataset(ds).iterate_items():
+            row = normalize_playlist_item(item, "details", PROF)
+            if not row: continue
+            m = df["Playlist_ID"].astype(str) == row["Playlist_ID"]
+            if not m.any(): continue
+            for col in ["Saves", "Track Count", "Median Playcount", "Last Added", "Reachability", "Quality Score", "Is Dump Bin"]:
+                df.loc[m, col] = row[col]
+            if not is_valid_data(df.loc[m, "Description"].iloc[0]) and row["Description"]:
+                df.loc[m, "Description"] = row["Description"]
+            updated += int(m.sum())
+        st.session_state.df = ensure_schema(df); persist(st.session_state.df)
+        flash("success", f"Updated details for {updated} playlists."); st.rerun()
+    except Exception as e:
+        status.error(f"Detail fetch failed: {e}")
 
 def _run_discover(token, keywords=None, urls=None):
     progress, status = st.progress(0.0), st.empty()
@@ -1390,14 +1572,20 @@ def page_playlists():
     tier = f1.radio("Contact", ["All", "A · open for subs", "B · has contact", "Needs manual look"], horizontal=False)
     lane = f2.radio("Reachability", ["All", "In your lane", "Stretch", "Skip (superstars)", "Below you", "Unknown"], horizontal=False)
     cost = f3.radio("Cost", ["All", "free", "paid-link", "unknown"], horizontal=False)
-    stage = f4.radio("Pipeline", ["All", "Not pitched", "Pitched", "Replied", "Added", "Declined"], horizontal=False)
+    stage = f4.radio("Pipeline", ["All", "Not pitched", "Pitched", "Replied", "Added", "Declined"], horizontal=False,
+                     help="Declined includes curators whose description says 'no submissions' — auto-marked so they never enter the queue.")
     search = st.text_input("Search name / owner / description")
-    only_bands = st.checkbox("Only inside my saves + lane bands", value=False)
+    h1, h2 = st.columns(2)
+    hide_nc = h1.checkbox("Hide playlists with no contact", value=True, help="Tier C rows stay stored (a sibling 'Submit' playlist can still fill them) but are hidden here by default.")
+    only_bands = h2.checkbox("Only inside my saves + lane bands", value=False)
 
     v = df.copy()
-    if tier.startswith("A"): v = v[v["Contact Tier"] == "A"]
-    elif tier.startswith("B"): v = v[v["Contact Tier"] == "B"]
-    elif tier.startswith("Needs"): v = v[~v.apply(has_contact, axis=1) & ~v["Is Editorial"]]
+    if hide_nc and not tier.startswith("Needs"): v = v[v.apply(has_contact, axis=1)]
+    if tier.startswith("A ·"): v = v[v["Contact Tier"] == "A"]
+    elif tier.startswith("B ·"): v = v[v["Contact Tier"] == "B"]
+    elif tier.startswith("Needs"):
+        v = v[~v.apply(has_contact, axis=1) & ~v["Is Editorial"]].sort_values("Invites Subs", ascending=False)
+        st.info(f"{int(v['Invites Subs'].sum())} of these INVITE submissions but hid the contact — start your manual stalking there (listed first).")
     if lane != "All": v = v[v["Reachability"] == lane]
     if cost != "All": v = v[v["Cost Tag"] == cost]
     if stage == "Not pitched": v = v[~v["Pitched"]]
@@ -1408,8 +1596,8 @@ def page_playlists():
     if only_bands: v = v[v.apply(lambda r: in_bands(r, PROF), axis=1)]
     st.caption(f"{len(v)} of {len(df)} playlists · {v.loc[v['Owner_ID'].apply(is_valid_data), 'Owner_ID'].nunique()} curators")
 
-    show_cols = ["🗑️ Block", "❌ Remove", "Pitched", "Replied", "Added", "Playlist Name", "Owner Name", "Saves", "Track Count",
-                 "Contact Tier", "Reachability", "Cost Tag", "Email Address", "Instagram", "Submission Link", "Contact Source",
+    show_cols = ["🗑️ Block", "❌ Remove", "Pitched", "Replied", "Added", "Playlist Name", "Owner Name", "Saves", "Track Count", "Last Added",
+                 "Contact Tier", "Invites Subs", "Reachability", "Cost Tag", "Email Address", "Instagram", "Submission Link", "Contact Source",
                  "Quality Score", "Fit Score", "Draft Pitch", "🔄 Regenerate", "Notes", "Playlist URL", "Description"]
     edited = st.data_editor(
         v[show_cols], width="stretch", height=560, num_rows="fixed", key="pl_editor",
@@ -1436,7 +1624,10 @@ def page_playlists():
             for col in show_cols:
                 if col in UI_ONLY_COLS: continue
                 new, old = edited.at[i, col], df.at[i, col]
-                if str(new) != str(old) and not (pd.isna(new) and pd.isna(old)):
+                blank = lambda v: v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() in ("", "nan", "None", "None Found")
+                if blank(new) and blank(old):
+                    continue
+                if str(new) != str(old):
                     df.at[i, col] = new
                     if col in ("Email Address", "Instagram", "Submission Link"):
                         df.at[i, "Contact Source"], df.at[i, "Contact Confidence"] = "manual", 100
@@ -1508,11 +1699,30 @@ def page_settings():
 
     with st.container(border=True):
         st.subheader("Apify actor")
-        PROF["actor_id"] = st.text_input("Spotify actor ID", PROF.get("actor_id", DEFAULT_ACTOR), help="Copy the exact slug from the Apify store page.")
-        PROF["actor_style"] = st.selectbox("Input/output style", ["all-in-one", "playlist-scraper"],
-                                           index=0 if PROF.get("actor_style", "all-in-one") == "all-in-one" else 1,
-                                           help="all-in-one = khadinakbar/spotify-all-in-one-scraper. playlist-scraper = ScrapeArchitect-style (playlist_description, owner_url…). The field mapper tolerates both.")
-        st.caption("After your first run, open **Discover → Raw sample** to confirm `description`, `followers`, `owner` and a tracklist with playcounts came back.")
+        PROF["actor_id"] = st.text_input("Spotify actor slug (owner/actor-name)", PROF.get("actor_id", ""),
+                                         placeholder="e.g. scrapearchitect/spotify-playlist-scraper",
+                                         help="Open the actor on apify.com — the slug is the last two parts of the URL: apify.com/OWNER/ACTOR-NAME.")
+        PROF["actor_style"] = st.selectbox("Actor style", ["playlist-scraper", "all-in-one"],
+                                           index=0 if PROF.get("actor_style", "playlist-scraper") == "playlist-scraper" else 1,
+                                           help="playlist-scraper = a dedicated Spotify PLAYLIST actor (returns only playlists — cheapest). "
+                                                "all-in-one = khadinakbar's multi-type actor (bills ~6 entity types per keyword — avoid for search).")
+        c1, c2, c3 = st.columns(3)
+        PROF["max_usd_per_run"] = c1.number_input("Hard cap per run (USD)", 0.10, 50.0, float(PROF.get("max_usd_per_run", 1.0)), step=0.10,
+                                                  help="Apify aborts the run when this is reached. Your real safety net.")
+        PROF["results_per_keyword"] = c2.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5)
+        PROF["fetch_details"] = c3.checkbox("Fetch full details during search", value=bool(PROF.get("fetch_details", False)),
+                                            help="OFF (recommended) = fast mode: description + owner only, cheapest. Details are fetched later just for contactable playlists via Discover → step 3.")
+        st.markdown("**What to skip at ingest**")
+        d1, d2 = st.columns(2)
+        PROF["skip_instrumental"] = d1.checkbox("Skip type-beat / instrumental playlists", value=bool(PROF.get("skip_instrumental", True)),
+                                                help="Decided mainly by the playlist NAME ('Boom Bap Beats', 'Hip Hop Instrumentals'). Mixed playlists that mention vocals are kept.")
+        PROF["skip_mainstream"] = d1.checkbox("Skip mainstream / superstar playlists", value=bool(PROF.get("skip_mainstream", True)),
+                                              help="'Famous songs', 'Top 100', 'chart hits', or two-plus mega-stars (Drake, Eminem, Kanye…) in the text. Genre-taste names like Nujabes or Little Simz do NOT trigger it.")
+        PROF["keep_no_contact"] = d2.checkbox("Store playlists with no contact (hidden by default)", value=bool(PROF.get("keep_no_contact", True)),
+                                              help="Keeping them lets a sibling 'Submit Your Music' playlist from the same curator fill in the contact later. Untick to discard them outright.")
+        PROF["exclude_words"] = st.text_input("Extra playlist-name words to skip (comma-separated)", PROF.get("exclude_words", ""))
+        st.caption("Cost reality: Spotify actors need residential proxies, which Apify bills on top of the per-result price. "
+                   "Fast mode + the hard cap keep this small. After a run, open **Discover → Raw sample** to check `playlist_description` / `owner` came back.")
 
     if st.button("💾 Save settings", type="primary"):
         save_profile(PROF); cloud_sync(); flash("success", "Settings saved and synced."); st.rerun()
