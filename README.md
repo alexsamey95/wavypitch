@@ -42,7 +42,7 @@ The sidebar shows `☁️ All changes saved to GitHub · HH:MM`, a pending count
 
 ## Apify actor — one actor, hardwired
 
-The app is hardwired to the **"Spotify Playlists"** actor (search + full details + added-dates). Settings → Apify actor → paste its slug (`OWNER/NAME` from `apify.com/OWNER/NAME`) or the ID from `console.apify.com/actors/<ID>`. That's the only configuration.
+The app is hardwired to **[augeas/spotify-playlists](https://apify.com/augeas/spotify-playlists)** — search + full details + added-dates. It is pre-filled; the only keys you need are your Apify token and Gemini key (plus GitHub for auto-save).
 
 Why this one: it's the only actor found whose keyword search (`terms`) returns, with `expand` on, **followers, track count, and a tracklist with both `plays` and `addedAt`** — so contacts, saves, Quality, Reachability *and real Freshness* are all filled on the first run, with input keys documented as real JSON (`terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration`). No guessing.
 

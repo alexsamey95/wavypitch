@@ -87,7 +87,7 @@ DEFAULT_PROFILE = {
     "lane_max_pop": 55,
     "dump_bin_tracks": 500,
     "daily_cap": 0,                  # 0 = no send cap. Outreach pacing is the user's call, not the app's.
-    "actor_id": "",                 # the "Spotify Playlists" actor — slug (owner/name) or the ID from console.apify.com/actors/<ID>
+    "actor_id": "augeas/spotify-playlists",   # https://apify.com/augeas/spotify-playlists — hardwired default
     "results_per_keyword": 20,
     "track_limit": 200,              # tracks fetched per playlist. Freshness = newest addedAt among fetched tracks, so fetch enough to reach the end.
     "use_apify_proxy": False,        # actor default is no proxy (it uses Spotify's API, not page scraping) — proxies are the hidden cost
@@ -107,6 +107,8 @@ def load_profile():
                 prof.update(json.load(f) or {})
         except Exception:
             pass
+    if not str(prof.get("actor_id") or "").strip():
+        prof["actor_id"] = DEFAULT_PROFILE["actor_id"]
     return prof
 
 def save_profile(prof):
@@ -848,6 +850,37 @@ def show_flash():
 # description, ownerName, ownerId, followers, totalTracks, tracks[] {artists[].artistName, plays, addedAt}.
 # The ONLY actor found that does keyword search + followers + playcounts + added-dates in one pass.
 # ----------------------------------------------------------------------------
+def normalize_actor_id(raw):
+    """Accept anything the user pastes and return a valid Apify actor reference, or raise a clear error.
+    Handles: owner/name · owner~name · bare 17-char ID · https://apify.com/owner/name[...] ·
+    https://console.apify.com/actors/<ID>[...] · trailing slashes / whitespace."""
+    t = str(raw or "").strip().strip("/")
+    if not t:
+        raise RuntimeError("No Apify actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
+    m = re.search(r"console\.apify\.com/actors/([A-Za-z0-9]{10,})", t)
+    if m:
+        return m.group(1)
+    m = re.search(r"apify\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", t)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    t = t.replace("~", "/")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", t):
+        return t
+    if re.fullmatch(r"[A-Za-z0-9]{10,}", t):
+        return t
+    raise RuntimeError(f"'{raw}' isn't a valid actor reference. Use OWNER/NAME (from apify.com/OWNER/NAME) or the ID from console.apify.com/actors/<ID>.")
+
+def check_actor(token, raw):
+    """Ask Apify for the actor. Returns (resolved_id, display_title) or raises."""
+    from apify_client import ApifyClient
+    aid = normalize_actor_id(raw)
+    info = ApifyClient(token).actor(aid).get()
+    if not info:
+        raise RuntimeError(f"Apify has no actor at '{aid}'. Check the slug/ID.")
+    title = info.get("title") or info.get("name") or aid
+    owner = info.get("username") or ""
+    return aid, (f"{title} — by {owner}" if owner else title)
+
 def _proxy_cfg(prof):
     return {"useApifyProxy": bool(prof.get("use_apify_proxy", False))}
 
@@ -1026,9 +1059,7 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     owner-pivot. Mutates + returns df and a summary string. Raises on Apify failure."""
     from apify_client import ApifyClient
     client = ApifyClient(token)
-    actor = (prof.get("actor_id") or "").strip()
-    if not actor:
-        raise RuntimeError("No Apify actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
+    actor = normalize_actor_id(prof.get("actor_id"))
     per_kw, tl = int(prof.get("results_per_keyword", 20)), int(prof.get("track_limit", 200))
     if urls:
         run_input, total, label = build_url_input(urls, tl, prof), len(urls), "Scraping playlist URLs"
@@ -1392,9 +1423,7 @@ def _run_details(token, urls):
     try:
         from apify_client import ApifyClient
         client = ApifyClient(token)
-        actor = (PROF.get("actor_id") or "").strip()
-        if not actor:
-            raise RuntimeError("No Apify actor set in Settings.")
+        actor = normalize_actor_id(PROF.get("actor_id"))
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
         tl = int(PROF.get("track_limit", 200))
         status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF), len(urls), report, "Fetching playlist details", max_usd=cap or None, max_items=len(urls))
@@ -1734,8 +1763,19 @@ def page_settings():
 
     with st.container(border=True):
         st.subheader("Apify actor")
-        PROF["actor_id"] = st.text_input("Spotify Playlists actor — slug or ID", PROF.get("actor_id", ""),
-                                         placeholder="OWNER/NAME from apify.com/OWNER/NAME, or the ID from console.apify.com/actors/<ID>")
+        a, b = st.columns([4, 1], vertical_alignment="bottom")
+        PROF["actor_id"] = a.text_input("Spotify Playlists actor", PROF.get("actor_id") or "augeas/spotify-playlists",
+                                        help="Default: https://apify.com/augeas/spotify-playlists. Only change this if you switch actors.")
+        if b.button("Check actor", width="stretch", disabled=not (get_key("APIFY_API_TOKEN") and (PROF.get("actor_id") or "").strip())):
+            try:
+                aid, title = check_actor(get_key("APIFY_API_TOKEN"), PROF["actor_id"])
+                PROF["actor_id"] = aid; save_profile(PROF); cloud_sync()
+                st.session_state["_actor_ok"] = f"✅ {title}  ·  saved as `{aid}`"
+            except Exception as e:
+                st.session_state["_actor_ok"] = f"❌ {e}"
+            st.rerun()
+        if st.session_state.get("_actor_ok"):
+            st.caption(st.session_state["_actor_ok"])
 
     with st.container(border=True):
         st.subheader("Targeting")
