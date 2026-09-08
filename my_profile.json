@@ -16,7 +16,7 @@
   "daily_cap": 0,
   "data_source": "spotify_api",
   "actor_id": "https://apify.com/augeas/spotify-playlists",
-  "results_per_keyword": 20,
+  "results_per_keyword": 40,
   "track_limit": 200,
   "fetch_tracks": false,
   "run_timeout_min": 6,
