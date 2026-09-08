@@ -40,23 +40,23 @@ Token: GitHub → Settings → Developer settings → **Fine-grained tokens** �
 
 The sidebar shows `☁️ All changes saved to GitHub · HH:MM`, a pending count, or an error. There's also a manual **Save to cloud now** button, and a ZIP backup in Settings as belt-and-braces.
 
-## Apify actor — use a DEDICATED playlist scraper
+## Apify actor — one actor, hardwired
 
-Settings → Apify actor → paste the slug of a **Spotify playlist** actor (e.g. `scrapearchitect/spotify-playlist-scraper` — copy the exact slug from its Apify store URL, `apify.com/OWNER/ACTOR`). Style `playlist-scraper`.
+The app is hardwired to the **"Spotify Playlists"** actor (search + full details + added-dates). Settings → Apify actor → paste its slug (`OWNER/NAME` from `apify.com/OWNER/NAME`) or the ID from `console.apify.com/actors/<ID>`. That's the only configuration.
 
-**Why not the all-in-one actor:** its keyword search returns ~6 entity types (artists, albums, tracks, playlists, shows, episodes) per keyword and bills every one — we only keep playlists, so ~5/6 of the spend is thrown away. A dedicated playlist actor returns only playlists. Style `all-in-one` is still supported for URL-mode detail fetches but is warned against for search.
+Why this one: it's the only actor found whose keyword search (`terms`) returns, with `expand` on, **followers, track count, and a tracklist with both `plays` and `addedAt`** — so contacts, saves, Quality, Reachability *and real Freshness* are all filled on the first run, with input keys documented as real JSON (`terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration`). No guessing.
 
-**One full-detail pass by default:** every result arrives with description, owner, saves, tracklist (playcounts, and added-dates if the actor provides them), so contacts, Freshness and Reachability are all filled on the first run. A cheaper description-only mode is a toggle in Settings.
+- **Tracks per playlist** (default 200): Freshness = newest added-date among fetched tracks, and new adds usually sit at the *end* of a playlist, so fetch enough to reach it. Dump-bins over your threshold are skipped anyway.
+- **Proxy**: the actor defaults to no proxy (it uses Spotify's API). Leave off unless runs get blocked — proxy bandwidth is billed extra.
+- **Spend cap**: off by default (Settings). If set, Apify aborts the run at that spend.
 
-**No guessed field names:** Settings → *Read input schema from Apify* pulls the actor's real input fields and proposes the templates. Recommended actor: the **Spotify Playlists Scraper** (the one that returns per-track `addedAt`, which powers Freshness).
-
-**Hard cap:** every run is started with `max_total_charge_usd` (default $1.00, Settings) — Apify aborts the run at the cap. Residential proxy bandwidth (required for Spotify) is billed by Apify on top of per-result pricing, so the cap is your real safety net. **After your first run, open Discover → "Raw sample"** and confirm the actor returned `description`, `followers`, `owner`, and a tracklist with `playcount` — those power the contact sweep and the Reachability score. If a field is missing, the mapper degrades gracefully (you'll just see `Unknown` reachability or fewer auto-found contacts) rather than crashing.
+The row mapper stays tolerant to other actors' field names, but the *input* is this actor's, exactly.
 
 ## Cost (realistic)
 
 | API | Job | ≈ per month |
 |---|---|---|
-| Apify Spotify playlist actor | discovery (fast mode) | varies by actor + proxy usage — set the hard cap |
+| Apify “Spotify Playlists” actor | discovery, one pass with full details | check its Pricing tab; no proxy by default |
 | Apify Instagram scraper | bio → email, gated | $0.50–1.50 |
 | Gemini Flash | name cleanup | pennies |
 | Claude.ai (free batch loop) | writing pitches | $0 |

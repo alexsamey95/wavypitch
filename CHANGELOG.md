@@ -1,6 +1,15 @@
 # Changelog
 
-## v1.6 — current: one full-detail pass, no guessed field names
+## v2.0 — current: ONE hardwired actor that does everything
+
+- **Hardwired to the “Spotify Playlists” actor** (`terms / startUrls / maxItems / maxTracks / expand / proxyConfiguration`). Its output (`playlistId, playlistName, description, ownerName, ownerId, followers, totalTracks, tracks[].plays, tracks[].addedAt`) is the only one found with keyword search + followers + playcounts + **added-dates** in one pass.
+- Removed the template / schema-reading UI and the details-actor slot — no field-name guessing anywhere. One config field: the actor slug or ID.
+- **Real Freshness** (Fresh ≤30d / Active ≤90d / Stale ≤1y / Dormant) from `addedAt`; **Reachability** from real per-track plays; mapper also reads Spotify popularity when an actor provides it instead.
+- URL mode sends Apify-standard `startUrls: [{"url"}]` and automatically retries with plain strings if the actor rejects it.
+- Tracks per playlist default 200 (freshness needs the end of the playlist); Apify proxy off by default (actor uses Spotify's API); spend cap off by default.
+- End-to-end verified against the actor's documented sample: editorial / instrumental / superstar rows skipped, contact + freshness + reachability filled.
+
+## v1.6: one full-detail pass, no guessed field names
 
 - **Default is now ONE PASS with full details on**: every result arrives with saves, track count, playcounts and (if the actor provides it) per-track added-dates — so Freshness, Reachability and Quality are filled on the first run. Costs more per result; the hard cap (default now $2) is the ceiling.
 - **Settings → "Read input schema from Apify"**: the app pulls the actor's real input fields from Apify and proposes the search/URL templates automatically (keywords / limit / details / URLs / track limit). Review, apply, done — no hand-typed field names, works with any playlist actor. Recommended actor: the *Spotify Playlists Scraper* (returns `addedAt`).

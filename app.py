@@ -51,7 +51,6 @@ PROFILE_FILE = "my_profile.json"
 
 APIFY_POLL_TIMEOUT_SECS = 15 * 60
 GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_ACTOR = "khadinakbar/spotify-all-in-one-scraper"
 FOLLOW_UP_DAYS = 7
 
 KEY_NAMES = {"APIFY_API_TOKEN": "Apify", "GEMINI_API_KEY": "Gemini"}
@@ -84,18 +83,16 @@ DEFAULT_PROFILE = {
     "saves_max": 200000,
     "lane_min_plays": 50000,
     "lane_max_plays": 5000000,
+    "lane_min_pop": 15,              # Spotify track popularity (0–100) band = "in your lane"
+    "lane_max_pop": 55,
     "dump_bin_tracks": 500,
-    "daily_cap": 15,
-    "actor_id": "",                 # paste the exact slug from the Apify store page
-    "actor_style": "playlist-scraper",  # dedicated playlist actor: returns ONLY playlists (no wasted entity types)
+    "daily_cap": 0,                  # 0 = no send cap. Outreach pacing is the user's call, not the app's.
+    "actor_id": "",                 # the "Spotify Playlists" actor — slug (owner/name) or the ID from console.apify.com/actors/<ID>
     "results_per_keyword": 20,
-    "fetch_details": True,           # ONE PASS: full details during search so saves/tracks/addedAt/freshness fill on the first run
+    "track_limit": 200,              # tracks fetched per playlist. Freshness = newest addedAt among fetched tracks, so fetch enough to reach the end.
+    "use_apify_proxy": False,        # actor default is no proxy (it uses Spotify's API, not page scraping) — proxies are the hidden cost
     "skip_instrumental": True,       # drop type-beat / instrumental playlists at ingest (they won't add vocals)
     "skip_mainstream": True,         # drop "famous songs / Top 100 / chart hits / Drake, Eminem, Kanye…" playlists at ingest
-    "details_actor_id": "",          # optional 2nd actor for the details step — pick one that returns per-track addedAt (freshness)
-    "details_actor_style": "same",   # same | playlist-scraper | all-in-one | custom
-    "details_input_template": "",    # style=custom: the actor's input JSON with __URLS__ where the URL list goes
-    "search_input_template": "",     # main actor style=custom: input JSON with __KEYWORDS__ and __LIMIT__ placeholders
     "exclude_words": "type beat, instrumental, beat tape, producer pack",  # extra NAME words to skip
     "keep_no_contact": True,         # store Tier-C rows (hidden by default) so sibling contacts can still fill them
     "max_usd_per_run": 0.0,          # 0 = no spend cap (user's choice). Set >0 to have Apify abort the run at that spend.
@@ -123,7 +120,7 @@ COLUMN_ORDER = [
     "Pitched", "Followed Up", "Replied", "Added", "Declined",
     "Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB",
     "Playlist_ID", "Playlist Name", "Playlist URL", "Owner Name", "Owner_ID", "Owner URL",
-    "Saves", "Track Count", "Median Playcount", "Last Added", "Freshness", "Description", "Keyword",
+    "Saves", "Track Count", "Median Popularity", "Median Playcount", "Last Added", "Freshness", "Description", "Keyword",
     "Contact Tier", "Reachability", "Cost Tag", "Fit Score", "Quality Score",
     "Email Address", "Instagram", "Submission Link", "Contact Source", "Contact Confidence",
     "IG Bio", "IG Followers",
@@ -141,7 +138,7 @@ TEXT_DEFAULTS = {
 }
 BOOL_COLS = ["🗑️ Block", "❌ Remove", "Pitched", "Followed Up", "Replied", "Added", "Declined",
              "🔄 Regenerate", "Is Editorial", "Is Dump Bin", "Invites Subs"]
-INT_COLS = ["Saves", "Track Count", "Median Playcount", "Fit Score", "Quality Score",
+INT_COLS = ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Fit Score", "Quality Score",
             "Contact Confidence", "IG Followers"]
 DATE_COLS = ["Pitch_Date", "FollowUp_Date", "Added_Date", "Added_To_DB", "Last Added"]
 UI_ONLY_COLS = ["🗑️ Block", "❌ Remove"]
@@ -690,6 +687,17 @@ def quality_score(saves, track_count, description, prof):
         s += 15  # real audience per track, not a dumping ground
     return int(min(100, s))
 
+def reachability_from_popularity(med_pop, prof):
+    """Spotify track popularity 0–100 (this actor returns it per track). Superstar tracks sit 80–100,
+    genuinely small artists under ~40. Banded by your Settings."""
+    if med_pop < 0:
+        return "Unknown"
+    lo, hi = int(prof.get("lane_min_pop", 15)), int(prof.get("lane_max_pop", 55))
+    if med_pop >= 78: return "Skip (superstars)"
+    if med_pop > hi: return "Stretch"
+    if med_pop >= lo: return "In your lane"
+    return "Below you"
+
 def reachability_bucket(median_plays, prof):
     """Proxy: how big are the artists already on this playlist? Uses the median
     per-track playcount from the scraped tracklist, banded relative to your lane
@@ -834,106 +842,22 @@ def show_flash():
         getattr(st, level, st.info)(msg)
 
 # ----------------------------------------------------------------------------
-# Actor adapter — tolerant to BOTH shortlisted actors' field names so the app
-# works out of the box with either. Swap actor + style in Settings.
-#   all-in-one       → khadinakbar/spotify-all-in-one-scraper (camelCase, `owner` object)
-#   playlist-scraper → ScrapeArchitect-style (snake_case: playlist_description, owner_url…)
+# Actor — hardwired to the "Spotify Playlists" actor (input per its docs: terms / startUrls / maxItems /
+# maxTracks / pageSize / expand / proxyConfiguration). Output per its sample: playlistId, playlistName,
+# description, ownerName, ownerId, followers, totalTracks, tracks[] {artists[].artistName, plays, addedAt}.
+# The ONLY actor found that does keyword search + followers + playcounts + added-dates in one pass.
 # ----------------------------------------------------------------------------
-def fetch_actor_input_schema(token, actor_id):
-    """Pull the actor's input schema from Apify (latest build). Returns dict of property_name -> {type, title, description}."""
-    from apify_client import ApifyClient
-    client = ApifyClient(token)
-    actor = client.actor(actor_id).get()
-    if not actor:
-        raise RuntimeError(f"Actor '{actor_id}' not found — check the slug (apify.com/OWNER/ACTOR).")
-    build_id = None
-    tagged = actor.get("taggedBuilds") or {}
-    for tag in ("latest", "beta"):
-        if isinstance(tagged.get(tag), dict) and tagged[tag].get("buildId"):
-            build_id = tagged[tag]["buildId"]; break
-    schema = None
-    if build_id:
-        build = client.build(build_id).get() or {}
-        schema = build.get("inputSchema")
-    if not schema:
-        raise RuntimeError("Could not read the actor's input schema from Apify. Paste the input JSON from its API tab manually instead.")
-    if isinstance(schema, str):
-        schema = json.loads(schema)
-    props = schema.get("properties", {}) or {}
-    return {k: {"type": v.get("type", ""), "title": v.get("title", ""), "description": (v.get("description", "") or "")[:140],
-                "default": v.get("default", None), "editor": v.get("editor", "")} for k, v in props.items()}
+def _proxy_cfg(prof):
+    return {"useApifyProxy": bool(prof.get("use_apify_proxy", False))}
 
-def propose_templates(props):
-    """Heuristically map schema fields → search / URL templates. Returns (search_tpl, url_tpl, notes)."""
-    notes, search, url = [], {}, {}
-    def find(pattern, types=None):
-        for k, v in props.items():
-            if re.search(pattern, k + " " + (v.get("title") or ""), re.I) and (types is None or v["type"] in types):
-                return k
-        return None
-    kw = find(r"keyword|search\s*(?:term|quer|text)|\bquer|\bterms?\b", ("array", "string"))
-    urls = find(r"url|uri|playlist\s*(?:id|link)", ("array", "string"))
-    lim = find(r"limit|max\s*(?:results?|items?|playlists?)|results?\s*(?:per|count)|count", ("integer", "number"))
-    det = find(r"detail|full|enrich|deep", ("boolean",))
-    track_lim = find(r"track.*(?:limit|max|count)", ("integer", "number"))
-    if kw:
-        search[kw] = "__KEYWORDS__" if props[kw]["type"] == "array" else "__KEYWORD_STRING__"
-        if props[kw]["type"] != "array": notes.append(f"'{kw}' takes a single string — keywords will be joined with commas; check the actor accepts that.")
-    else:
-        notes.append("No keyword field found — this actor may not support keyword search.")
-    if lim: search[lim] = "__LIMIT__"
-    if det: search[det] = True
-    if track_lim: search[track_lim] = 50
-    if urls:
-        url[urls] = "__URLS__"
-        if det: url[det] = True
-        if track_lim: url[track_lim] = 50
-    else:
-        notes.append("No URL/URI field found — manual URL adds and detail refreshes won't work with this actor.")
-    for k, v in props.items():  # keep sensible defaults for anything that looks required-ish
-        if k in search or k in url: continue
-        if v.get("default") is not None and re.search(r"proxy|country", k, re.I):
-            search[k] = v["default"]; url[k] = v["default"]
-    return json.dumps(search, indent=2), json.dumps(url, indent=2), notes
+def build_search_input(keywords, per_kw, track_limit, prof):
+    return {"terms": list(keywords), "maxItems": int(per_kw), "expand": True,
+            "maxTracks": int(track_limit), "pageSize": 50, "proxyConfiguration": _proxy_cfg(prof)}
 
-def _fill_template(tpl, **vals):
-    """Substitute __NAME__ placeholders in an actor input JSON template. A quoted "__NAME__" becomes the raw JSON value."""
-    out = tpl
-    for k, v in vals.items():
-        j = json.dumps(v)
-        out = out.replace(f'"__{k}__"', j).replace(f"__{k}__", j if not isinstance(v, (int, float)) else str(v))
-    return json.loads(out)
-
-def build_search_input(style, keywords, per_kw, fetch_details=False, prof=None):
-    if style == "custom":
-        tpl = ((prof or {}).get("search_input_template") or "").strip()
-        if not tpl:
-            raise RuntimeError("Main actor style is 'custom' but no search input JSON template is set in Settings.")
-        return _fill_template(tpl, KEYWORDS=keywords, KEYWORD_STRING=", ".join(keywords), LIMIT=int(per_kw), FETCH_DETAILS=bool(fetch_details))
-    if style == "playlist-scraper":
-        return {"searchMode": "keyword", "keywords": keywords, "maxResults": per_kw, "fetchDetails": bool(fetch_details), "trackLimit": 40 if fetch_details else 0}
-    return {"searchQueries": keywords, "searchResultsPerType": per_kw,
-            "maxResults": per_kw * len(keywords), "responseFormat": "concise"}
-
-def build_details_input(prof, urls):
-    """Input for the details step via the optional details actor. 'custom' substitutes __URLS__ in a JSON template
-    copied from the actor's API tab — so ANY actor works without a code change."""
-    style = prof.get("details_actor_style", "same")
-    if style == "same":
-        style = prof.get("actor_style", "playlist-scraper")
-    if style == "custom":
-        tpl = (prof.get("details_input_template") or "").strip()
-        if not tpl and prof.get("actor_style") == "custom":
-            raise RuntimeError("Main actor is 'custom' — also paste its URL-mode input JSON (with __URLS__) under Details actor → template.")
-        if not tpl:
-            raise RuntimeError("Details actor style is 'custom' but no input JSON template is set in Settings.")
-        return json.loads(tpl.replace('"__URLS__"', json.dumps(urls)).replace("__URLS__", json.dumps(urls)))
-    return build_url_input(style, urls)
-
-def build_url_input(style, urls):
-    if style == "playlist-scraper":
-        return {"searchMode": "url", "urls": urls, "fetchDetails": True, "trackLimit": 40}
-    return {"spotifyUrls": urls, "responseFormat": "concise", "maxResults": len(urls)}
+def build_url_input(urls, track_limit, prof, plain=False):
+    # Apify's standard "Start URLs" field takes [{"url": ...}]; `plain` sends bare strings as a fallback.
+    return {"startUrls": (list(urls) if plain else [{"url": u} for u in urls]),
+            "maxTracks": int(track_limit), "proxyConfiguration": _proxy_cfg(prof)}
 
 def _first(d, *keys, default=""):
     for k in keys:
@@ -947,7 +871,7 @@ def _playlist_id_from(url_or_uri):
 
 def _owner_bits(item):
     owner = _first(item, "owner", "playlist_owner", "ownerName", default="")
-    name, oid, ourl = "", "", _first(item, "owner_url", "ownerUrl", default="")
+    name, oid, ourl = "", _first(item, "ownerId", "owner_id", default=""), _first(item, "owner_url", "ownerUrl", default="")
     if isinstance(owner, dict):
         name = _first(owner, "name", "displayName", "display_name", "id", default="")
         oid = _first(owner, "id", "uri", "url", default="")
@@ -971,7 +895,7 @@ def _tracks_summary(item):
         tracks = tracks.get("items")
     if not tracks and isinstance(item.get("content"), dict):
         tracks = item["content"].get("items")
-    plays, artists, added = [], [], []
+    plays, artists, added, pops = [], [], [], []
     for t in (tracks or [])[:60]:
         if not isinstance(t, dict):
             continue
@@ -980,7 +904,13 @@ def _tracks_summary(item):
         aa = aa.get("isoString") if isinstance(aa, dict) else (aa or t.get("added_at") if isinstance(t, dict) else None)
         if aa:
             added.append(str(aa))
-        pc = _first(d, "playcount", "playCount", "play_count", default=None)
+        pp = _first(d, "tracks popularity", "popularity", "track_popularity", default=None)
+        try:
+            if pp is not None and str(pp).strip():
+                pops.append(int(float(str(pp))))
+        except Exception:
+            pass
+        pc = _first(d, "playcount", "playCount", "play_count", "plays", default=None)
         try:
             if pc is not None and str(pc).strip():
                 plays.append(int(float(str(pc).replace(",", ""))))
@@ -992,7 +922,7 @@ def _tracks_summary(item):
         if isinstance(a, list):
             for x in a:
                 if isinstance(x, dict):
-                    nm = _first(x, "name", default="") or _first(x.get("profile", {}) if isinstance(x.get("profile"), dict) else {}, "name", default="")
+                    nm = _first(x, "name", "artistName", default="") or _first(x.get("profile", {}) if isinstance(x.get("profile"), dict) else {}, "name", default="")
                     if nm:
                         artists.append(str(nm))
                 elif isinstance(x, str):
@@ -1000,8 +930,9 @@ def _tracks_summary(item):
         elif isinstance(a, str):
             artists.append(a)
     med = int(median(plays)) if plays else 0
+    med_pop = int(median(pops)) if pops else -1
     last = pd.to_datetime(max(added), errors="coerce", utc=True).tz_localize(None) if added else pd.NaT
-    return med, " ".join(dict.fromkeys(artists)), last
+    return med, " ".join(dict.fromkeys(artists)), last, med_pop
 
 def normalize_playlist_item(item, keyword, prof):
     """Map one raw actor item → one schema row. Returns None if it's not a playlist."""
@@ -1010,13 +941,13 @@ def normalize_playlist_item(item, keyword, prof):
     typ = str(item.get("type", "playlist")).lower()
     if typ and typ != "playlist":
         return None
-    url = _first(item, "url", "playlist_url", "uri", default="")
-    pid = _first(item, "playlist_id", "id", default="") or _playlist_id_from(url)
+    url = _first(item, "url", "playlist_url", "playlistUrl", "uri", default="")
+    pid = _first(item, "playlist_id", "playlistId", "id", default="") or _playlist_id_from(url)
     if url.startswith("spotify:playlist:"):
         url = "https://open.spotify.com/playlist/" + url.split(":")[-1]
     if not url and pid:
         url = f"https://open.spotify.com/playlist/{pid}"
-    name = normalize_text(_first(item, "name", "playlist_title", "title", default=""))
+    name = normalize_text(_first(item, "name", "playlist_title", "playlistName", "title", default=""))
     desc = str(_first(item, "description", "playlist_description", default="") or "")
     owner_name, owner_id, owner_url = _owner_bits(item)
     owner_name_n = normalize_text(owner_name)
@@ -1026,7 +957,7 @@ def normalize_playlist_item(item, keyword, prof):
     tracks_n = safe_int(_first(item, "totalTracks", "total_tracks", "trackCount", "totalCount", default=0))
     if not tracks_n and isinstance(item.get("content"), dict):
         tracks_n = safe_int(item["content"].get("totalCount", 0))
-    med_plays, artists_text, last_added = _tracks_summary(item)
+    med_plays, artists_text, last_added, med_pop = _tracks_summary(item)
 
     c = sweep_contacts(owner_name_n, name, desc)
     tier = contact_tier(c["email"], c["instagram"], c["link"], name, desc)
@@ -1036,7 +967,10 @@ def normalize_playlist_item(item, keyword, prof):
         "Owner Name": owner_name_n, "Owner_ID": owner_id, "Owner URL": owner_url,
         "Saves": saves, "Track Count": tracks_n, "Median Playcount": med_plays, "Last Added": last_added,
         "Description": normalize_text(desc)[:1500], "Keyword": keyword,
-        "Contact Tier": tier, "Reachability": ("Skip (superstars)" if looks_mainstream(name, desc) else reachability_bucket(med_plays, prof)), "Cost Tag": ctag,
+        "Contact Tier": tier,
+        "Reachability": ("Skip (superstars)" if looks_mainstream(name, desc)
+                         else (reachability_from_popularity(med_pop, prof) if med_pop >= 0 else reachability_bucket(med_plays, prof))),
+        "Median Popularity": med_pop if med_pop >= 0 else 0, "Cost Tag": ctag,
         "Fit Score": fit_score(prof.get("keywords", ""), name, desc, artists_text),
         "Quality Score": quality_score(saves, tracks_n, desc, prof),
         "Email Address": c["email"] or "None Found", "Instagram": c["instagram"] or "None",
@@ -1091,19 +1025,21 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     owner-pivot. Mutates + returns df and a summary string. Raises on Apify failure."""
     from apify_client import ApifyClient
     client = ApifyClient(token)
-    style = prof.get("actor_style", "playlist-scraper")
     actor = (prof.get("actor_id") or "").strip()
     if not actor:
-        raise RuntimeError("No Apify actor set — paste the actor slug (e.g. owner/spotify-playlist-scraper) in Settings → Apify actor.")
-    per_kw = int(prof.get("results_per_keyword", 20))
+        raise RuntimeError("No Apify actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
+    per_kw, tl = int(prof.get("results_per_keyword", 20)), int(prof.get("track_limit", 200))
     if urls:
-        run_input = build_details_input(prof, urls) if style == "custom" else build_url_input(style, urls)
-        total, label = len(urls), "Scraping playlist URLs"
+        run_input, total, label = build_url_input(urls, tl, prof), len(urls), "Scraping playlist URLs"
     else:
-        run_input, total, label = build_search_input(style, keywords, per_kw, prof.get("fetch_details", False), prof), per_kw * len(keywords), "Searching Spotify"
+        run_input, total, label = build_search_input(keywords, per_kw, tl, prof), per_kw * len(keywords), "Searching Spotify (full details)"
     cap = float(prof.get("max_usd_per_run", 0.0) or 0)
     report(0.0, f"Starting {actor}" + (f" (cap ${cap:.2f})" if cap else "") + "…")
     status, dataset_id = run_apify_and_poll(client, actor, run_input, total, report, label, max_usd=cap or None, max_items=total)
+    if status != "SUCCEEDED" and urls:
+        # startUrls shape fallback: some actors want bare strings instead of {"url": ...}
+        report(0.1, "Retrying URL mode with plain URL strings…")
+        status, dataset_id = run_apify_and_poll(client, actor, build_url_input(urls, tl, prof, plain=True), total, report, label, max_usd=cap or None, max_items=total)
     if status != "SUCCEEDED":
         raise RuntimeError(f"Apify run ended with status: {status}")
     report(0.97, "Filtering, sweeping contacts, scoring…")
@@ -1398,13 +1334,9 @@ def page_discover():
         keywords = [k.strip() for k in kws_text.splitlines() if k.strip()]
         est = per_kw * len(keywords)
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
-        mode = "full details in one pass — saves, tracks, dates all filled" if PROF.get("fetch_details", True) else "description-only (cheap); details fetched later for contactable rows"
-        c2.caption(f"≈ {est} playlists this run · " + (f"**cap ${cap:.2f}**" if cap else "**no spend cap**") + f" · mode: {mode}.")
-        if PROF.get("actor_style") == "all-in-one":
-            st.warning("The all-in-one actor bills ~6 entity types per keyword (artists, tracks, albums, shows…) and we only keep playlists. "
-                       "A dedicated playlist scraper is far cheaper for this job — switch it in Settings.")
+        c2.caption(f"≈ {est} playlists this run · " + (f"**cap ${cap:.2f}**" if cap else "**no spend cap**") + " · one pass: description, owner, followers, tracks with playcounts + added-dates.")
         if not (PROF.get("actor_id") or "").strip():
-            st.error("No actor set — paste the actor slug in Settings → Apify actor (copy it from the Apify store page URL: apify.com/OWNER/ACTOR).")
+            st.error("No actor set — paste the Spotify Playlists actor's slug or ID in Settings → Apify actor.")
         if st.button(f"Search Spotify ({len(keywords)} keywords)", type="primary", disabled=not (token and keywords)):
             PROF["keywords"], PROF["results_per_keyword"] = kws_text, int(per_kw)
             save_profile(PROF)
@@ -1423,8 +1355,7 @@ def page_discover():
         st.subheader("3 · Refresh details for contactable playlists (optional)")
         df = st.session_state.df
         need_det = df[df.apply(has_contact, axis=1) & (df["Saves"] == 0) & ~df["Is Editorial"]] if len(df) else df
-        st.caption(f"{len(need_det)} contactable playlists are missing saves/tracklist (e.g. scraped before full-detail mode, or added by hand). "
-                   "This fills them in via the details actor.")
+        st.caption(f"{len(need_det)} contactable playlists are missing saves/tracklist (scraped by an earlier build, or added by hand). This fills them in.")
         n_det = st.number_input("Max playlists this pass", 1, 200, min(25, max(1, len(need_det))), key="n_det")
         if st.button(f"Fetch details for {min(int(n_det), len(need_det))} playlists", disabled=not (token and len(need_det))):
             urls = need_det["Playlist URL"].head(int(n_det)).tolist()
@@ -1460,11 +1391,14 @@ def _run_details(token, urls):
     try:
         from apify_client import ApifyClient
         client = ApifyClient(token)
-        actor = (PROF.get("details_actor_id") or PROF.get("actor_id") or "").strip()
+        actor = (PROF.get("actor_id") or "").strip()
         if not actor:
             raise RuntimeError("No Apify actor set in Settings.")
         cap = float(PROF.get("max_usd_per_run", 0.0) or 0)
-        status_, ds = run_apify_and_poll(client, actor, build_details_input(PROF, urls), len(urls), report, f"Fetching details via {actor}", max_usd=cap or None, max_items=len(urls))
+        tl = int(PROF.get("track_limit", 200))
+        status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF), len(urls), report, "Fetching playlist details", max_usd=cap or None, max_items=len(urls))
+        if status_ != "SUCCEEDED":
+            status_, ds = run_apify_and_poll(client, actor, build_url_input(urls, tl, PROF, plain=True), len(urls), report, "Fetching playlist details (retry)", max_usd=cap or None, max_items=len(urls))
         if status_ != "SUCCEEDED":
             raise RuntimeError(f"Apify run ended with status: {status_}")
         df, updated = st.session_state.df, 0
@@ -1473,8 +1407,8 @@ def _run_details(token, urls):
             if not row: continue
             m = df["Playlist_ID"].astype(str) == row["Playlist_ID"]
             if not m.any(): continue
-            for col in ["Saves", "Track Count", "Median Playcount", "Reachability", "Quality Score", "Is Dump Bin"]:
-                if col in ("Saves", "Track Count", "Median Playcount") and not row[col]:
+            for col in ["Saves", "Track Count", "Median Popularity", "Median Playcount", "Reachability", "Quality Score", "Is Dump Bin"]:
+                if col in ("Saves", "Track Count", "Median Popularity", "Median Playcount") and not row[col]:
                     continue  # never overwrite a known number with a zero from a thin record
                 df.loc[m, col] = row[col]
             if pd.notna(row["Last Added"]):
@@ -1604,11 +1538,14 @@ def _mark_pitched(idx, channel):
 def page_send():
     show_flash()
     st.title("📤 Send")
-    st.caption("One curator at a time, one pitch each. Paced so your inbox stays trusted.")
+    st.caption("One curator at a time, one pitch each. How and how fast you reach out is yours.")
     df = st.session_state.df
-    cap, today = int(PROF.get("daily_cap", 15)), pitched_today(df)
-    st.progress(min(1.0, today / max(1, cap)), text=f"Sent today: {today} / {cap} (daily cap — change in Settings)")
-    capped = today >= cap
+    cap, today = int(PROF.get("daily_cap", 0) or 0), pitched_today(df)
+    if cap:
+        st.progress(min(1.0, today / max(1, cap)), text=f"Sent today: {today} / {cap} (optional cap — Settings)")
+    else:
+        st.caption(f"Pitched today: {today}")
+    capped = bool(cap) and today >= cap
 
     q = curator_queue(df, PROF)
     q = q[q.apply(lambda r: in_bands(r, PROF), axis=1)] if len(q) else q
@@ -1653,7 +1590,7 @@ def page_send():
             if st.button("Skip / decline this curator", key=f"dec_{idx}", width="stretch"):
                 st.session_state.df.loc[idx, "Declined"] = True; persist(st.session_state.df); st.rerun()
         if capped:
-            st.info("Daily cap reached — come back tomorrow. Spreading sends out protects your deliverability.")
+            st.info("You've hit the optional daily cap you set in Settings.")
         with st.expander("Copy-ready DM"):
             st.code(pitch, language=None, wrap_lines=True)
 
@@ -1800,58 +1737,31 @@ def page_settings():
         smin, smax = st.slider("Saves band", 0, 500000, (int(PROF["saves_min"]), int(PROF["saves_max"])), step=500,
                                help="Playlists must fall in this range to reach the pitch queue. The uncontested small curators often sit at 1k–10k — keep the floor low.")
         PROF["saves_min"], PROF["saves_max"] = smin, smax
-        lmin, lmax = st.slider("'In your lane' — median per-track plays of artists already on the playlist", 1000, 50000000,
-                               (int(PROF["lane_min_plays"]), int(PROF["lane_max_plays"])), step=1000,
-                               help="Proxy for how big the artists on the playlist are. Above the top = Stretch; > 50M = superstar playlists (skipped).")
+        lmin, lmax = st.slider("'In your lane' — median plays of the tracks already on the playlist", 1000, 50000000,
+                               (int(PROF["lane_min_plays"]), int(PROF["lane_max_plays"])), step=1000, format="%d",
+                               help="How big are the artists already on it? Median per-track playcount from the scraped tracklist. "
+                                    "Above your top = Stretch; > 50M = superstar playlists (skipped). Below your floor = Below you.")
         PROF["lane_min_plays"], PROF["lane_max_plays"] = lmin, lmax
         c1, c2 = st.columns(2)
         PROF["dump_bin_tracks"] = c1.number_input("Flag as dump-bin above this many tracks", 50, 5000, int(PROF["dump_bin_tracks"]), step=50)
-        PROF["daily_cap"] = c2.number_input("Daily send cap", 1, 200, int(PROF["daily_cap"]))
+        PROF["daily_cap"] = c2.number_input("Daily send cap (0 = none)", 0, 500, int(PROF.get("daily_cap", 0) or 0), help="Off by default — outreach pacing is your call.")
 
     with st.container(border=True):
-        st.subheader("Apify actor")
-        PROF["actor_id"] = st.text_input("Spotify actor slug (owner/actor-name)", PROF.get("actor_id", ""),
-                                         placeholder="e.g. scrapearchitect/spotify-playlist-scraper",
-                                         help="Open the actor on apify.com — the slug is the last two parts of the URL: apify.com/OWNER/ACTOR-NAME.")
-        st.markdown("**Let the app read the actor's real input fields (recommended — no guessing)**")
-        if st.button("🔎 Read input schema from Apify", disabled=not (get_key("APIFY_API_TOKEN") and (PROF.get("actor_id") or "").strip())):
-            try:
-                props = fetch_actor_input_schema(get_key("APIFY_API_TOKEN"), PROF["actor_id"].strip())
-                st.session_state["_schema_props"] = props
-                st.session_state["_schema_proposal"] = propose_templates(props)
-            except Exception as e:
-                st.error(f"Schema read failed: {e}")
-        if st.session_state.get("_schema_props"):
-            props = st.session_state["_schema_props"]
-            with st.expander(f"Actor input fields ({len(props)})", expanded=False):
-                st.table(pd.DataFrame([{"field": k, "type": v["type"], "title": v["title"], "default": str(v["default"]) if v["default"] is not None else ""} for k, v in props.items()]))
-            s_tpl, u_tpl, notes = st.session_state["_schema_proposal"]
-            for nte in notes: st.warning(nte)
-            st.caption("Proposed templates (edit if needed, then apply). __KEYWORDS__ / __LIMIT__ / __URLS__ get filled at run time.")
-            s_tpl = st.text_area("Search template (details ON)", s_tpl, height=140, key="prop_s")
-            u_tpl = st.text_area("URL / details template", u_tpl, height=110, key="prop_u")
-            if st.button("✅ Use these templates", type="primary"):
-                PROF["actor_style"], PROF["search_input_template"] = "custom", s_tpl
-                PROF["details_actor_style"], PROF["details_input_template"] = "custom", u_tpl
-                save_profile(PROF); cloud_sync(); flash("success", "Actor templates applied — Discover now runs one full-detail pass."); st.rerun()
-        _ms = ["playlist-scraper", "custom", "all-in-one"]
-        PROF["actor_style"] = st.selectbox("Actor style", _ms, index=_ms.index(PROF.get("actor_style", "playlist-scraper")) if PROF.get("actor_style") in _ms else 0,
-                                           help="playlist-scraper = ScrapeArchitect-style keys (searchMode/keywords/fetchDetails). "
-                                                "custom = ANY playlist actor: paste its input JSON from the Apify API tab with __KEYWORDS__ / __LIMIT__ placeholders — "
-                                                "use this to run the Spotify Playlists Scraper (the one with per-track addedAt) as your only actor. "
-                                                "all-in-one = khadinakbar multi-type actor (bills ~6 entity types per keyword — avoid for search).")
-        if PROF["actor_style"] == "custom":
-            PROF["search_input_template"] = st.text_area("Search input JSON template", PROF.get("search_input_template", ""), height=110,
-                                                         placeholder='{"searchKeywords": "__KEYWORDS__", "searchLimit": "__LIMIT__", "fetchFullDetails": false}',
-                                                         help="Open the actor on Apify → API tab → copy the JSON input → replace the keyword list with \"__KEYWORDS__\" and the limit with \"__LIMIT__\". "
-                                                              "Keep full-details OFF here (cheap search); put the URL-mode JSON with \"__URLS__\" under Details actor → template below.")
+        st.subheader("Apify actor — “Spotify Playlists” (search + full details + added-dates)")
+        st.caption("Hardwired to this actor's documented input (`terms / startUrls / maxItems / maxTracks / expand`). Every search runs with `expand` on: "
+                   "description, owner, followers, track count, and a tracklist with **playcounts and added-dates** — so contacts, saves, Quality, Reachability "
+                   "**and real Freshness** are all filled on the first run.")
+        PROF["actor_id"] = st.text_input("Actor slug or ID", PROF.get("actor_id", ""), placeholder="OWNER/NAME from apify.com/OWNER/NAME — or the ID from console.apify.com/actors/<ID>",
+                                         help="Open the actor on Apify and copy either the store slug (last two parts of the store URL) or the ID in the console URL. Both work.")
         c1, c2, c3 = st.columns(3)
         PROF["max_usd_per_run"] = c1.number_input("Spend cap per run (USD) — 0 = no cap", 0.0, 500.0, float(PROF.get("max_usd_per_run", 0.0)), step=0.50,
                                                   help="Off by default. If set, Apify aborts the run at this spend.")
         PROF["results_per_keyword"] = c2.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5)
-        PROF["fetch_details"] = c3.checkbox("Full details during search (one pass — recommended)", value=bool(PROF.get("fetch_details", True)),
-                                            help="ON = every result arrives with saves, tracklist, playcounts and (if the actor provides it) added-dates, so Freshness and Reachability are filled on the first run. "
-                                                 "Costs more per result; the hard cap is your ceiling. OFF = cheap description-only search, details fetched later for contactable rows.")
+        PROF["track_limit"] = c3.number_input("Tracks fetched per playlist", 50, 1000, int(PROF.get("track_limit", 200)), step=50,
+                                              help="Freshness = newest added-date among the tracks fetched, and new adds usually sit at the END of a playlist — so fetch enough to reach it. "
+                                                   "200 covers most curated playlists (dump-bins over your threshold are skipped anyway). 50 tracks per request.")
+        PROF["use_apify_proxy"] = st.checkbox("Use Apify proxy", value=bool(PROF.get("use_apify_proxy", False)),
+                                              help="The actor defaults to no proxy (it calls Spotify's API rather than scraping pages). Turn on only if runs fail with blocks — proxy bandwidth is billed extra.")
         st.markdown("**What to skip at ingest**")
         d1, d2 = st.columns(2)
         PROF["skip_instrumental"] = d1.checkbox("Skip type-beat / instrumental playlists", value=bool(PROF.get("skip_instrumental", True)),
@@ -1866,19 +1776,6 @@ def page_settings():
 
     if st.button("💾 Save settings", type="primary"):
         save_profile(PROF); cloud_sync(); flash("success", "Settings saved and synced."); st.rerun()
-
-    with st.container(border=True):
-        st.subheader("Details actor (optional) — for saves, tracklists and FRESHNESS")
-        st.caption("The wide search uses a cheap playlist scraper that returns no dates. The details step only runs on contactable playlists, "
-                   "so you can afford a richer actor there: one that returns per-track `addedAt` (e.g. the *Spotify Playlists Scraper*) fills `Last Added` → Freshness. "
-                   "Leave the slug blank to reuse the main actor.")
-        PROF["details_actor_id"] = st.text_input("Details actor slug (blank = same as main)", PROF.get("details_actor_id", ""), placeholder="owner/spotify-playlists-scraper")
-        _styles = ["same", "playlist-scraper", "all-in-one", "custom"]
-        PROF["details_actor_style"] = st.selectbox("Details actor input style", _styles, index=_styles.index(PROF.get("details_actor_style", "same")) if PROF.get("details_actor_style", "same") in _styles else 0,
-                                                   help="custom = paste the actor's input JSON (from its API tab on Apify) with __URLS__ where the playlist-URL list goes. Works with any actor.")
-        if PROF["details_actor_style"] == "custom":
-            PROF["details_input_template"] = st.text_area("Input JSON template", PROF.get("details_input_template", ""), height=110,
-                                                          placeholder='{"playlistUris": "__URLS__", "fetchDetails": true, "trackLimit": 50}')
 
     with st.container(border=True):
         st.subheader("API keys")
