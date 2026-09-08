@@ -46,7 +46,9 @@ Settings → Apify actor → paste the slug of a **Spotify playlist** actor (e.g
 
 **Why not the all-in-one actor:** its keyword search returns ~6 entity types (artists, albums, tracks, playlists, shows, episodes) per keyword and bills every one — we only keep playlists, so ~5/6 of the spend is thrown away. A dedicated playlist actor returns only playlists. Style `all-in-one` is still supported for URL-mode detail fetches but is warned against for search.
 
-**Fast mode by default:** search runs with `fetchDetails=false`, returning `playlist_description` + `playlist_owner` + `owner_url` — the contact fields — at the cheapest tier. Saves + tracklists are fetched later (Discover → step 3) **only for contactable playlists**, so credits never go to dead leads.
+**One full-detail pass by default:** every result arrives with description, owner, saves, tracklist (playcounts, and added-dates if the actor provides them), so contacts, Freshness and Reachability are all filled on the first run. A cheaper description-only mode is a toggle in Settings.
+
+**No guessed field names:** Settings → *Read input schema from Apify* pulls the actor's real input fields and proposes the templates. Recommended actor: the **Spotify Playlists Scraper** (the one that returns per-track `addedAt`, which powers Freshness).
 
 **Hard cap:** every run is started with `max_total_charge_usd` (default $1.00, Settings) — Apify aborts the run at the cap. Residential proxy bandwidth (required for Spotify) is billed by Apify on top of per-result pricing, so the cap is your real safety net. **After your first run, open Discover → "Raw sample"** and confirm the actor returned `description`, `followers`, `owner`, and a tracklist with `playcount` — those power the contact sweep and the Reachability score. If a field is missing, the mapper degrades gracefully (you'll just see `Unknown` reachability or fewer auto-found contacts) rather than crashing.
 

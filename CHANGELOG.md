@@ -1,6 +1,20 @@
 # Changelog
 
-## v1.4 — current (validated against a real 139-playlist run)
+## v1.6 — current: one full-detail pass, no guessed field names
+
+- **Default is now ONE PASS with full details on**: every result arrives with saves, track count, playcounts and (if the actor provides it) per-track added-dates — so Freshness, Reachability and Quality are filled on the first run. Costs more per result; the hard cap (default now $2) is the ceiling.
+- **Settings → "Read input schema from Apify"**: the app pulls the actor's real input fields from Apify and proposes the search/URL templates automatically (keywords / limit / details / URLs / track limit). Review, apply, done — no hand-typed field names, works with any playlist actor. Recommended actor: the *Spotify Playlists Scraper* (returns `addedAt`).
+- Cheap description-only mode still available as a toggle; step 3 becomes an optional "refresh details" for rows scraped before full-detail mode or added by hand.
+
+## v1.5
+
+- **Mainstream / chart / famous-artist playlists skipped at ingest** ("famous songs", "Top 100", "chart hits", "X Radio", or 2+ megastar name-drops; 3 if the text also signals indie-friendliness). Genre-taste names (Nujabes, Loyle Carner…) and vague words ("classics", "legends") deliberately excluded. 19/139 flagged on real data; "5pm hooping — unknown talents on the rise" correctly kept. Also sets Reachability = *Skip (superstars)* from text alone, so it works with no playcounts.
+- **Freshness** column: from `Last Added` when the actor returns per-track dates (Fresh ≤30d / Active ≤90d / Stale ≤1y / Dormant); otherwise the curator's own claim ("Claims: updated weekly") as a labelled hint, never as fact.
+- **Optional details actor**: a second actor slot for the details step (which only runs on contactable playlists). Point it at an actor that returns `addedAt` — e.g. the *Spotify Playlists Scraper* — to populate freshness. `custom` style accepts any actor's input JSON with `__URLS__`, so no code change is needed for a new actor.
+- Details fetch never overwrites known saves/track counts with zeros from a thin record.
+- **Main actor `custom` style**: paste any playlist actor's input JSON with `__KEYWORDS__` / `__LIMIT__` — lets you run the *Spotify Playlists Scraper* (returns `addedAt`) as your ONLY actor, for contacts + saves + freshness in one, if its cheap search mode returns descriptions.
+
+## v1.4 (validated against a real 139-playlist run)
 
 **Cost control**
 - Every Apify run starts with a **hard spend cap** (`max_total_charge_usd`, default $1.00, Settings) and an item cap. Apify aborts the run at the cap.
