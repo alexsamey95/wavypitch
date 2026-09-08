@@ -95,6 +95,7 @@ DEFAULT_PROFILE = {
     "skip_mainstream": True,         # drop "famous songs / Top 100 / chart hits / Drake, Eminem, Kanye…" playlists at ingest
     "exclude_words": "type beat, instrumental, beat tape, producer pack",  # extra NAME words to skip
     "keep_no_contact": True,         # store Tier-C rows (hidden by default) so sibling contacts can still fill them
+    "skip_blank": True,              # drop playlists with NO contact, NO submission invite and NO description — pure noise
     "max_usd_per_run": 0.0,          # 0 = no spend cap (user's choice). Set >0 to have Apify abort the run at that spend.
 }
 
@@ -1046,7 +1047,7 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
 
     raw_sample, rows = None, []
     existing = set(df["Playlist_ID"].astype(str))
-    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "nocontact": 0}
+    stats = {"seen": 0, "editorial": 0, "blocked": 0, "dup": 0, "kept": 0, "instrumental": 0, "mainstream": 0, "blank": 0, "nocontact": 0}
     kw_label = ", ".join(keywords) if keywords else "url"
     for item in client.dataset(dataset_id).iterate_items():
         if raw_sample is None:
@@ -1061,6 +1062,8 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
             stats["instrumental"] += 1; seen.add(row["Playlist_ID"]); continue
         if not urls and prof.get("skip_mainstream", True) and looks_mainstream(row["Playlist Name"], row["Description"]):
             stats["mainstream"] += 1; seen.add(row["Playlist_ID"]); continue
+        if not urls and prof.get("skip_blank", True) and row["Contact Tier"] == "C" and not row["Invites Subs"] and not normalize_text(row["Description"]).strip():
+            stats["blank"] += 1; seen.add(row["Playlist_ID"]); continue
         if row["Owner_ID"] in blocked:
             stats["blocked"] += 1; continue
         if row["Playlist_ID"] in existing or row["Playlist_ID"] in seen:
@@ -1084,7 +1087,7 @@ def core_discover(df, seen, blocked, token, prof, keywords, report, urls=None):
     contactable = sum(1 for r in rows if r["Contact Tier"] in ("A", "B"))
     nc = f"{stats['nocontact']} discarded (no contact)" if not prof.get("keep_no_contact", True) else f"{stats['nocontact']} with no contact yet (hidden by default in Playlists)"
     summary = (f"Kept {stats['kept']} new playlists: {contactable + sib} with a contact (+{sib} via sibling submit-playlists), {nc}. "
-               f"Skipped {stats['instrumental']} instrumental/type-beat, {stats['mainstream']} mainstream/superstar, {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
+               f"Skipped {stats['instrumental']} type-beat/instrumental, {stats['mainstream']} famous/chart, {stats['blank']} blank (no description, no contact), {stats['editorial']} editorial, {stats['dup']} already seen, {stats['blocked']} blocked.")
     return df, summary
 
 def core_scrape_instagram(df, igs_set, token, report):
@@ -1317,16 +1320,14 @@ def page_dashboard():
 def page_discover():
     show_flash()
     st.title("🔎 Discover")
-    st.caption("Keyword-search Spotify via Apify → drop editorial/dump-bin playlists → sweep every field for contacts → score. "
-               "Contacts are found for free from what the search already returned; the only extra credits are the optional IG bio scrape.")
+    st.caption("Search Spotify by keyword. Junk is dropped before it reaches your list; every field is swept for contacts.")
     token = get_key("APIFY_API_TOKEN")
     if not token:
         st.error("Apify token missing — add it in Settings.")
 
     with st.container(border=True):
         st.subheader("1 · Search by keywords")
-        st.caption("One keyword per line. Mix genre/mood with submission-intent terms — "
-                   "`trap submit`, `drill playlist submissions`, `melodic rap curator` — they bias the search toward playlists that *want* pitches.")
+        st.caption("One keyword per line. Adding `submit` / `submissions` / `curator` to a genre term biases results toward playlists that want pitches.")
         kws_text = st.text_area("Keywords", value=PROF.get("keywords", ""), height=120, placeholder="trap submit\nmelodic rap submissions\nunderground hip hop curator")
         c1, c2 = st.columns([1, 3])
         per_kw = c1.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5,
@@ -1722,71 +1723,60 @@ def page_settings():
     st.title("⚙️ Settings")
 
     with st.container(border=True):
-        st.subheader("You — the artist being pitched")
+        st.subheader("You")
         a, b = st.columns(2)
         PROF["artist_name"] = a.text_input("Artist name*", PROF.get("artist_name", ""))
-        PROF["genre"] = b.text_input("Genre*", PROF.get("genre", ""), placeholder="e.g. melodic trap")
+        PROF["genre"] = b.text_input("Genre*", PROF.get("genre", ""), placeholder="e.g. jazz rap / chill hip hop")
         PROF["track_link"] = a.text_input("Track link to pitch*", PROF.get("track_link", ""))
         PROF["epk_link"] = b.text_input("EPK / link-in-bio (optional)", PROF.get("epk_link", ""))
-        PROF["monthly_listeners"] = a.number_input("Your Spotify monthly listeners", 0, value=int(PROF.get("monthly_listeners", 1000)), step=100,
-                                                   help="Sets what 'in your lane' means.")
-        PROF["one_liner"] = st.text_input("One line about you / the track (goes into the pitch prompt)", PROF.get("one_liner", ""))
+        PROF["monthly_listeners"] = a.number_input("Your Spotify monthly listeners", 0, value=int(PROF.get("monthly_listeners", 1000)), step=100)
+        PROF["one_liner"] = b.text_input("One line about you / the track (used in the pitch prompt)", PROF.get("one_liner", ""))
 
     with st.container(border=True):
-        st.subheader("Targeting — sliders over already-scraped data (re-slicing costs nothing)")
+        st.subheader("Apify actor")
+        PROF["actor_id"] = st.text_input("Spotify Playlists actor — slug or ID", PROF.get("actor_id", ""),
+                                         placeholder="OWNER/NAME from apify.com/OWNER/NAME, or the ID from console.apify.com/actors/<ID>")
+
+    with st.container(border=True):
+        st.subheader("Targeting")
         smin, smax = st.slider("Saves band", 0, 500000, (int(PROF["saves_min"]), int(PROF["saves_max"])), step=500,
-                               help="Playlists must fall in this range to reach the pitch queue. The uncontested small curators often sit at 1k–10k — keep the floor low.")
+                               help="Playlists outside this range don't enter the pitch queue.")
         PROF["saves_min"], PROF["saves_max"] = smin, smax
         lmin, lmax = st.slider("'In your lane' — median plays of the tracks already on the playlist", 1000, 50000000,
                                (int(PROF["lane_min_plays"]), int(PROF["lane_max_plays"])), step=1000, format="%d",
-                               help="How big are the artists already on it? Median per-track playcount from the scraped tracklist. "
-                                    "Above your top = Stretch; > 50M = superstar playlists (skipped). Below your floor = Below you.")
+                               help="How big are the artists already on it? Above your top = Stretch; > 50M = superstars (skipped).")
         PROF["lane_min_plays"], PROF["lane_max_plays"] = lmin, lmax
-        c1, c2 = st.columns(2)
-        PROF["dump_bin_tracks"] = c1.number_input("Flag as dump-bin above this many tracks", 50, 5000, int(PROF["dump_bin_tracks"]), step=50)
-        PROF["daily_cap"] = c2.number_input("Daily send cap (0 = none)", 0, 500, int(PROF.get("daily_cap", 0) or 0), help="Off by default — outreach pacing is your call.")
-
-    with st.container(border=True):
-        st.subheader("Apify actor — “Spotify Playlists” (search + full details + added-dates)")
-        st.caption("Hardwired to this actor's documented input (`terms / startUrls / maxItems / maxTracks / expand`). Every search runs with `expand` on: "
-                   "description, owner, followers, track count, and a tracklist with **playcounts and added-dates** — so contacts, saves, Quality, Reachability "
-                   "**and real Freshness** are all filled on the first run.")
-        PROF["actor_id"] = st.text_input("Actor slug or ID", PROF.get("actor_id", ""), placeholder="OWNER/NAME from apify.com/OWNER/NAME — or the ID from console.apify.com/actors/<ID>",
-                                         help="Open the actor on Apify and copy either the store slug (last two parts of the store URL) or the ID in the console URL. Both work.")
-        c1, c2, c3 = st.columns(3)
-        PROF["max_usd_per_run"] = c1.number_input("Spend cap per run (USD) — 0 = no cap", 0.0, 500.0, float(PROF.get("max_usd_per_run", 0.0)), step=0.50,
-                                                  help="Off by default. If set, Apify aborts the run at this spend.")
-        PROF["results_per_keyword"] = c2.number_input("Results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5)
-        PROF["track_limit"] = c3.number_input("Tracks fetched per playlist", 50, 1000, int(PROF.get("track_limit", 200)), step=50,
-                                              help="Freshness = newest added-date among the tracks fetched, and new adds usually sit at the END of a playlist — so fetch enough to reach it. "
-                                                   "200 covers most curated playlists (dump-bins over your threshold are skipped anyway). 50 tracks per request.")
-        PROF["use_apify_proxy"] = st.checkbox("Use Apify proxy", value=bool(PROF.get("use_apify_proxy", False)),
-                                              help="The actor defaults to no proxy (it calls Spotify's API rather than scraping pages). Turn on only if runs fail with blocks — proxy bandwidth is billed extra.")
-        st.markdown("**What to skip at ingest**")
-        d1, d2 = st.columns(2)
-        PROF["skip_instrumental"] = d1.checkbox("Skip type-beat / instrumental playlists", value=bool(PROF.get("skip_instrumental", True)),
-                                                help="Decided mainly by the playlist NAME ('Boom Bap Beats', 'Hip Hop Instrumentals'). Mixed playlists that mention vocals are kept.")
-        PROF["skip_mainstream"] = d1.checkbox("Skip mainstream / superstar playlists", value=bool(PROF.get("skip_mainstream", True)),
-                                              help="'Famous songs', 'Top 100', 'chart hits', or two-plus mega-stars (Drake, Eminem, Kanye…) in the text. Genre-taste names like Nujabes or Little Simz do NOT trigger it.")
-        PROF["keep_no_contact"] = d2.checkbox("Store playlists with no contact (hidden by default)", value=bool(PROF.get("keep_no_contact", True)),
-                                              help="Keeping them lets a sibling 'Submit Your Music' playlist from the same curator fill in the contact later. Untick to discard them outright.")
-        PROF["exclude_words"] = st.text_input("Extra playlist-name words to skip (comma-separated)", PROF.get("exclude_words", ""))
-        st.caption("Cost reality: Spotify actors need residential proxies, which Apify bills on top of the per-result price. "
-                   "Fast mode + the hard cap keep this small. After a run, open **Discover → Raw sample** to check `playlist_description` / `owner` came back.")
+        st.caption("Always skipped at ingest: Spotify editorial · type-beat / instrumental · famous-artist / chart / \"Top 100\" · blank (no description, no contact) · "
+                   "\"no submissions\" curators (auto-declined). Nothing to switch on.")
 
     if st.button("💾 Save settings", type="primary"):
         save_profile(PROF); cloud_sync(); flash("success", "Settings saved and synced."); st.rerun()
 
-    with st.container(border=True):
-        st.subheader("API keys")
-        st.caption("Set these as Streamlit secrets (see README). Session overrides below are temporary.")
+    with st.expander("Advanced"):
+        c1, c2, c3 = st.columns(3)
+        PROF["results_per_keyword"] = c1.number_input("Default results per keyword", 5, 200, int(PROF.get("results_per_keyword", 20)), step=5)
+        PROF["track_limit"] = c2.number_input("Tracks fetched per playlist", 50, 1000, int(PROF.get("track_limit", 200)), step=50,
+                                              help="Freshness = newest added-date among fetched tracks; new adds sit at the end, so fetch enough to reach it.")
+        PROF["dump_bin_tracks"] = c3.number_input("Dump-bin threshold (tracks)", 50, 5000, int(PROF["dump_bin_tracks"]), step=50,
+                                                  help="Playlists with more tracks than this aren't curated — skipped.")
+        d1, d2, d3 = st.columns(3)
+        PROF["max_usd_per_run"] = d1.number_input("Spend cap per run (USD, 0 = none)", 0.0, 500.0, float(PROF.get("max_usd_per_run", 0.0)), step=0.50)
+        PROF["daily_cap"] = d2.number_input("Daily send cap (0 = none)", 0, 500, int(PROF.get("daily_cap", 0) or 0))
+        PROF["use_apify_proxy"] = d3.checkbox("Use Apify proxy", value=bool(PROF.get("use_apify_proxy", False)), help="Only if runs get blocked — billed extra.")
+        e1, e2 = st.columns(2)
+        PROF["skip_instrumental"] = e1.checkbox("Skip type-beat / instrumental", value=bool(PROF.get("skip_instrumental", True)))
+        PROF["skip_mainstream"] = e1.checkbox("Skip famous-artist / chart playlists", value=bool(PROF.get("skip_mainstream", True)))
+        PROF["skip_blank"] = e2.checkbox("Skip blank playlists (no description, no contact)", value=bool(PROF.get("skip_blank", True)))
+        PROF["keep_no_contact"] = e2.checkbox("Keep no-contact playlists that DO have a description (hidden)", value=bool(PROF.get("keep_no_contact", True)),
+                                              help="A sibling 'Submit Your Music' playlist from the same curator can still fill them.")
+        PROF["exclude_words"] = st.text_input("Extra playlist-name words to skip (comma-separated)", PROF.get("exclude_words", ""))
+        st.markdown("**API key overrides (session only — normally set as secrets)**")
         for name, label in KEY_NAMES.items():
             st.text_input(f"{label} — {name}", value=st.session_state.get(f"key_{name}", ""), type="password", key=f"key_{name}",
                           placeholder="using secret ✓" if get_secret(name) else "not set")
         st.caption("☁️ GitHub auto-save: " + ("**ON** → " + _cloud_repo() + " / " + _cloud_branch() if cloud_enabled() else "**OFF** — add GITHUB_TOKEN + GITHUB_REPO secrets."))
 
-    with st.container(border=True):
-        st.subheader("Blocked curators")
+    with st.expander(f"Blocked curators ({len(blocked_owners)})"):
         if blocked_owners:
             for oid in sorted(blocked_owners):
                 a, b = st.columns([6, 1])
@@ -1796,8 +1786,7 @@ def page_settings():
         else:
             st.caption("None.")
 
-    with st.container(border=True):
-        st.subheader("Backup & restore")
+    with st.expander("Backup, restore & reset"):
         st.download_button("⬇️ Download backup (.zip)", build_backup_zip(st.session_state.df), f"wavy_pitch_backup_{time.strftime('%Y%m%d_%H%M')}.zip", "application/zip")
         up = st.file_uploader("Restore from a backup", type=["zip", "csv"])
         mode = st.radio("Restore mode", ["Merge with current", "Replace everything"], horizontal=True)
